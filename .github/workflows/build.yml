@@ -1,0 +1,20 @@
+name: Build VPK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:2026.08
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake
+          cmake --build build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sampler-vpk
+          path: build/Sampler.vpk
