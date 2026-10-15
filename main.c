@@ -163,6 +163,7 @@ static volatile int g_out_ch = 0;
 static volatile int g_discard = 0;
 static volatile int g_scrub = 0;
 static volatile int g_rev = 0, g_rev_req = 0;   /* обратное воспроизведение области (g_rev применяется вместе с областью) */
+static volatile float g_glitch_hz = 0.0f;  /* глитч: частота вкл/выкл звука, Гц (0 = выключен) */
 static volatile int g_mute = 0;            /* глитч: звук выключается, воспроизведение идёт дальше */
 static volatile int g_rate_only = 1;       /* скраб управляется только скоростью (без подтяжки к позиции) */
 static volatile int g_loop = 0;
@@ -181,6 +182,8 @@ static volatile int g_out_late = 0;             /* диагностика выв
 #define SL_MAX 32
 #define SL_MIN 4
 static int g_mode = 0;
+static volatile float g_tempo_mul = 1.0f;   /* множитель скорости от BPM-регулятора */
+static int g_bpm_base = 120, g_bpm_target = 120;
 static int g_sl_n = 8;                 /* сколько регионов получилось */
 static int g_sl_req = 8;               /* сколько регионов запрошено (4..32) */
 static int g_sl_sel = 0;               /* выбранный регион */
@@ -301,6 +304,7 @@ typedef struct {
     float scrub_gain;
     float gain;                 /* текущая громкость огибающей */
     int force_fade;             /* 1 = плавно затухнуть (стоп / пауза) */
+    double gphase;              /* фаза глитча 0..1 */
 } Engine;
 
 typedef struct {
@@ -313,6 +317,7 @@ typedef struct {
     float volume;
     double scrub_target, scrub_vel;
     int mute, rate_only, rev;
+    float glitch_hz;
 } Params;
 
 static void engine_reset(Engine *e, double pos) {
@@ -467,6 +472,11 @@ static int engine_render(Engine *e, const int16_t *a, int len, const Params *p,
     for (int i = 0; i < OUT_GRAIN; i++) {
         float s = 0.0f;
         float ft = (e->force_fade || p->mute) ? 0.0f : 1.0f;     /* цель огибающей */
+        if (p->glitch_hz > 0.0f) {
+            e->gphase += (double)p->glitch_hz / (double)OUT_RATE;
+            if (e->gphase >= 1.0) e->gphase -= 1.0;
+            if (e->gphase >= 0.5) ft = 0.0f;                    /* вторая половина периода - звук закрыт */
+        }
 
         if (ended) { mono[i] = 0; continue; }
 
@@ -569,9 +579,11 @@ static void load_params(Params *p, int lo, int hi) {
     int fb = g_fx[0], fr = g_fx[1], fs = g_fx[2], fp = g_fx[3], fc = g_fx[4];
     p->bits = 1 + fb;
     p->crush_hz = 500.0f * powf(32.0f, (float)fr / 100.0f);
-    p->speed = speed_from_idx(fs);
+    float tm = (g_mode == 1) ? g_tempo_mul : 1.0f;                /* BPM-регулятор работает в SLICE */
+    p->speed = speed_from_idx(fs) * tm;
+    p->glitch_hz = g_glitch_hz;
     p->pratio = powf(2.0f, ((float)(fp - 24) + (float)(fc - 50) / 100.0f) / 12.0f);
-    p->neutral = (fs == FX_SPEED_DEF && fp == 24 && fc == 50);
+    p->neutral = (fs == FX_SPEED_DEF && fp == 24 && fc == 50 && fabsf(tm - 1.0f) < 1e-4f);
     p->volume = (float)g_fx[5] / 100.0f;
     p->lo = lo;
     p->hi = hi;
@@ -849,6 +861,25 @@ typedef struct __attribute__((packed)) {
 static char g_wav_path[128] = "";
 static int g_wav_ver = -1;             /* версия звука, которая уже выгружена в g_wav_path */
 static int g_wav_overwrote = 0;
+
+static int write_wav_file(const char *path, const int16_t *d, int n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    uint32_t bytes = (uint32_t)n * 2;
+    WavHeader h;
+    memcpy(h.riff, "RIFF", 4);
+    h.size = 36 + bytes;
+    memcpy(h.wave, "WAVE", 4);
+    memcpy(h.fmt, "fmt ", 4);
+    h.fmt_size = 16; h.format = 1; h.channels = 1;
+    h.rate = SAMPLE_RATE; h.byte_rate = SAMPLE_RATE * 2; h.block_align = 2; h.bits = 16;
+    memcpy(h.data, "data", 4);
+    h.data_size = bytes;
+    fwrite(&h, sizeof(h), 1, f);
+    fwrite(d, 2, (size_t)n, f);
+    fclose(f);
+    return 0;
+}
 
 static int save_wav(char *path, size_t path_cap) {
     int len = g_length;
@@ -1416,6 +1447,20 @@ static void slices_pick(int n, const int16_t *a, int rlo, int rhi) {
 static int g_nov_ready = 0;                 /* новизна посчитана для g_nov_ver */
 static int g_slices_valid_ver = -1;         /* для какой версии звука корректны g_sl_pos */
 
+static void slices_ensure_nov(void) {
+    if (!g_nov_ready || g_nov_ver != g_audio_ver) {
+        onset_analyze(g_audio, g_length);
+        g_nov_ver = g_audio_ver;
+        g_nov_ready = 1;
+    }
+}
+
+/* исходный темп = найденный (или 120, если не нашёлся); reset - сбросить целевой темп на исходный */
+static void bpm_sync(int reset) {
+    int b = g_sl_bpm > 0 ? g_sl_bpm : 120;
+    if (reset || b != g_bpm_base) { g_bpm_base = b; g_bpm_target = b; g_tempo_mul = 1.0f; }
+}
+
 /* Подготовить нарезку для текущего звука. force = пересчитать регионы заново. */
 static void slices_prepare(int req, int force) {
     int len = g_length;
@@ -1435,6 +1480,7 @@ static void slices_prepare(int req, int force) {
     }
     slices_pick(req, g_audio, g_sl_lo, g_sl_hi);
     g_slices_valid_ver = g_audio_ver;
+    bpm_sync(1);
 }
 
 /* ---------- Рисование: помощники (только прямоугольники и текст) ---------- */
@@ -1878,7 +1924,7 @@ enum {
     B_NONE = -1,
     B_REC, B_PLAY, B_STOP, B_LOOP, B_FX,
     B_CROP, B_UNDO, B_SAVE, B_REV, B_NORM,
-    B_TAB_EDIT, B_TAB_SLICE, B_SL_MINUS, B_SL_PLUS, B_FX_CLOSE,
+    B_TAB_EDIT, B_TAB_SLICE, B_SL_MINUS, B_SL_PLUS, B_BPM_MINUS, B_BPM_PLUS, B_FX_CLOSE,
     B_PAD0 = 100
 };
 
@@ -1923,10 +1969,12 @@ static int btn_geom(int id, int mode, int fx_page, int sl_n, int *x, int *y, int
     /* режим SLICE */
     if (id >= B_PAD0 && id < B_PAD0 + sl_n) { pad_geom(id - B_PAD0, sl_n, x, y, w, h); return 1; }
     switch (id) {
-    case B_SL_MINUS: *x = 776; *y = 362; *w = 70; *h = 32; return 1;
-    case B_SL_PLUS:  *x = 854; *y = 362; *w = 70; *h = 32; return 1;
-    case B_LOOP:     *x = 776; *y = 410; *w = 70; *h = 68; return 1;
-    case B_FX:       *x = 854; *y = 410; *w = 70; *h = 68; return 1;
+    case B_SL_MINUS:  *x = 776; *y = 362; *w = 70; *h = 28; return 1;
+    case B_SL_PLUS:   *x = 854; *y = 362; *w = 70; *h = 28; return 1;
+    case B_BPM_MINUS: *x = 776; *y = 410; *w = 70; *h = 28; return 1;
+    case B_BPM_PLUS:  *x = 854; *y = 410; *w = 70; *h = 28; return 1;
+    case B_LOOP:      *x = 776; *y = 446; *w = 70; *h = 34; return 1;
+    case B_FX:        *x = 854; *y = 446; *w = 70; *h = 34; return 1;
     }
     return 0;
 }
@@ -1934,10 +1982,10 @@ static int btn_geom(int id, int mode, int fx_page, int sl_n, int *x, int *y, int
 static int hit_test(int tx, int ty, int mode, int fx_page, int sl_n) {
     static const int order_edit[] = { B_TAB_EDIT, B_TAB_SLICE, B_REC, B_PLAY, B_STOP, B_LOOP, B_FX,
                                       B_CROP, B_UNDO, B_SAVE, B_REV, B_NORM };
-    static const int order_slice[] = { B_TAB_EDIT, B_TAB_SLICE, B_SL_MINUS, B_SL_PLUS, B_LOOP, B_FX };
+    static const int order_slice[] = { B_TAB_EDIT, B_TAB_SLICE, B_SL_MINUS, B_SL_PLUS, B_BPM_MINUS, B_BPM_PLUS, B_LOOP, B_FX };
     static const int order_fx[] = { B_TAB_EDIT, B_TAB_SLICE, B_FX_CLOSE };
     const int *ord = fx_page ? order_fx : (mode == 0 ? order_edit : order_slice);
-    int n = fx_page ? 3 : (mode == 0 ? 12 : 6);
+    int n = fx_page ? 3 : (mode == 0 ? 12 : 8);
     for (int i = 0; i < n; i++) {
         int x, y, w, h;
         int sx = 0, sy = 0;
@@ -1968,7 +2016,7 @@ typedef struct {
     char msg[160];
     int sl_n, sl_sel, sl_flash, sl_playing;
     int btn_down, can_undo;
-    int crop_armed, legend, rev, bpm;
+    int crop_armed, legend, rev, bpm, bpm_t, bpm_b;
     double scrub_pos, scrub_speed;
     unsigned frame;
     Layout lay;
@@ -2153,8 +2201,8 @@ static void draw_pad(Canvas *c, const UiState *u, int i, int cy0) {
               playing ? RGBA8(200, 255, 200, 255) : (sel ? K_YELLOW : RGBA8(150, 134, 108, 255)));
 }
 
-static const int g_side_ids[4] = { B_SL_MINUS, B_SL_PLUS, B_LOOP, B_FX };
-static const int g_side_ics[4] = { IC_MINUS, IC_PLUS, IC_LOOP, IC_FX };
+static const int g_side_ids[6] = { B_SL_MINUS, B_SL_PLUS, B_BPM_MINUS, B_BPM_PLUS, B_LOOP, B_FX };
+static const int g_side_ics[6] = { IC_MINUS, IC_PLUS, IC_MINUS, IC_PLUS, IC_LOOP, IC_FX };
 
 static int side_style(const UiState *u, int k) {
     if (g_side_ids[k] == B_LOOP && u->loop) return 1;
@@ -2228,7 +2276,7 @@ static int ctl_update(Canvas *c, const UiState *u) {
                 changed = 1;
             }
         }
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < 6; k++) {
             int code = 1 + side_style(u, k) + 4 * (u->btn_down == g_side_ids[k]);
             if (code != g_wcode[W_SIDE0 + k]) {
                 int x, y, w, h;
@@ -2457,7 +2505,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя панель: название и вкладки */
     text(62, 30, K_BROWN, 1.25f, "VITA SAMPLER");
-    text(62, 44, K_BROWN_LO, 0.62f, "SAMPLER / LOOPER   v1.1");
+    text(62, 44, K_BROWN_LO, 0.62f, "SAMPLER / LOOPER   v1.2");
     text_c(384 + 46, 31, u->mode == 0 ? K_CREAM_HI : K_BROWN, 0.95f, "EDIT");
     text_c(484 + 46, 31, u->mode == 1 ? K_CREAM_HI : K_BROWN, 0.95f, "SLICE");
     text(622, 31, u->loop ? RGBA8(160, 240, 170, 255) : K_BROWN_LO, 0.9f, "LOOP");
@@ -2555,6 +2603,8 @@ static void ui_draw(const UiState *u) {
         }
         snprintf(buf, sizeof(buf), "SLICES  %d", u->sl_n);
         text(776, 354, K_BROWN, 1.0f, buf);
+        snprintf(buf, sizeof(buf), "BPM  %d%s", u->bpm_t, u->bpm > 0 ? "" : "?");
+        text(776, 406, u->bpm_t != u->bpm_b ? K_ORANGE_LO : K_BROWN, 1.0f, buf);
     }
 
     /* подсказка и окно справки */
@@ -2564,7 +2614,7 @@ static void ui_draw(const UiState *u) {
         rect_outline(24, 58, 912, 254, 2, K_ORANGE_LO);
         static const char *L[] = {
             "CONTROLS                                                              (SELECT closes)",
-            "R  record / stop       L  play / pause  (hold L = glitch gate; rear panel centre up/down = rate)",
+            "R  record / stop       L  play / pause  (hold L = glitch 1-20 Hz; rear panel: finger left/right = rate)",
             "TRIANGLE  stop (hold = keep position)      SQUARE  loop      CIRCLE  effects",
             "START  save WAV   SELECT  help   SELECT+LEFT/RIGHT  EDIT/SLICE   SELECT+START hold  exit   TRIANGLE x2  reset A-B",
             "EDIT   sticks move cursors A / B      both sticks up / down = zoom in / out",
@@ -2572,11 +2622,12 @@ static void ui_draw(const UiState *u) {
             "       touch the top of the wave: next to A or B and drag = move it (two fingers ok); inside A-B = move both",
             "       REVERSE toggles backwards playback (hold = bake into the sample)   NORMALIZE: region A-B to full level",
             "       touch the wave lower down = scrub: finger near the line = 1x, farther = faster (max x2)",
-            "SLICE  regions are built inside A-B chosen in EDIT      X  play slice",
+            "SLICE  regions are built inside A-B chosen in EDIT      X  play slice      BPM +/- = tempo (speed follows)",
             "       sticks nudge slice start / end      D-pad left/right = pick slice, up/down = count",
+            "       touch the top of the wave near a slice line and drag = move the boundary;  START also exports every slice",
             "MENU   D-pad up/down row, left/right value, left stick, touch sliders, X reset (hold = all)"
         };
-        for (int i = 0; i < 12; i++) text(40, 80 + i * 20, i == 0 ? K_YELLOW : K_AMBER_LT, 0.82f, L[i]);
+        for (int i = 0; i < 13; i++) text(40, 78 + i * 19, i == 0 ? K_YELLOW : K_AMBER_LT, 0.82f, L[i]);
     }
 }
 
@@ -2655,7 +2706,10 @@ typedef struct {
     int crop_armed; unsigned crop_frame;
     int tri_active, tri_frames, tri_pos;
     unsigned tri_last;
-    int rev_hold, gl_period;
+    int btn_hold, gl_period;
+    float gl_hz;
+    int sdrag_on, sdrag_id, sdrag_idx;
+    double sdrag_x0, sdrag_c0, sdrag_spp;
     double scrub_head;
     int scrubbing, scrub_id, resume_state, scrub_seg;
     double scrub_pos, scrub_speed, mk_frac[2];
@@ -2946,12 +3000,36 @@ static void act_undo(void) {
     dbg_log("undo -> %d", nl);
 }
 
+/* каждый регион нарезки - отдельным файлом рядом с основным: rec_005_s01.wav, rec_005_s02.wav ... */
+static int export_slices(void) {
+    if (!g_wav_path[0] || g_sl_n < 1) return 0;
+    char base[128];
+    snprintf(base, sizeof(base), "%s", g_wav_path);
+    size_t bl = strlen(base);
+    if (bl > 4 && strcmp(base + bl - 4, ".wav") == 0) base[bl - 4] = 0;
+    int ok = 0;
+    for (int i = 0; i < g_sl_n; i++) {
+        int a = g_sl_pos[i], b = g_sl_pos[i + 1];
+        if (a < 0) a = 0;
+        if (b > g_length) b = g_length;
+        if (b - a < 16) continue;
+        char p[160];
+        snprintf(p, sizeof(p), "%s_s%02d.wav", base, i + 1);
+        if (write_wav_file(p, g_audio + a, b - a) == 0) ok++;
+    }
+    return ok;
+}
+
 static void act_save(void) {
     if (g_state == ST_RECORDING) return;
     char path[128];
     int r = save_wav(path, sizeof(path));
     if (r == 0) {
         snprintf(msg, sizeof(msg), g_wav_overwrote ? "Saved (same file updated): %s" : "Saved: %s", path);
+        if (g_mode == 1) {
+            int n = export_slices();
+            snprintf(msg, sizeof(msg), "Saved %s + %d slice files (_s01 ...)", path, n);
+        }
         dirty = 0;
         request_autosave(g_length, 0);
         dbg_log("saved %s", path);
@@ -3001,6 +3079,20 @@ static void slice_view_fit(int length) {
     clamp_view(length);
 }
 
+static void act_bpm_change(int d) {
+    if (g_mode != 1 || g_length < 2) return;
+    int t = g_bpm_target + d;
+    int lo = (int)(g_bpm_base * 0.4f), hi = (int)(g_bpm_base * 2.5f);
+    if (lo < 30) lo = 30;
+    if (hi > 400) hi = 400;
+    if (t < lo) t = lo;
+    if (t > hi) t = hi;
+    g_bpm_target = t;
+    g_tempo_mul = (float)t / (float)g_bpm_base;
+    snprintf(msg, sizeof(msg), "Tempo %d BPM  (original %d%s, speed x%d.%02d)", t, g_bpm_base, g_sl_bpm > 0 ? "" : "?",
+             (int)g_tempo_mul, (int)(g_tempo_mul * 100.0f + 0.5f) % 100);
+}
+
 static void act_set_mode(int m) {
     if (m == g_mode) return;
     if (g_state == ST_RECORDING) return;
@@ -3012,6 +3104,12 @@ static void act_set_mode(int m) {
         int changed = (rlo != g_sl_lo || rhi != g_sl_hi || g_sl_pos[0] != rlo || g_sl_pos[g_sl_n] != rhi);
         g_sl_lo = rlo; g_sl_hi = rhi;
         slices_prepare(g_sl_req, changed);
+        if (!changed && g_sl_bpm == 0) {
+            slices_ensure_nov();
+            double T_, G_;
+            tempo_estimate(g_sl_lo, g_sl_hi, &T_, &G_);
+            bpm_sync(0);
+        }
         if (changed) g_sl_sel = 0;
         if (g_sl_sel >= g_sl_n) g_sl_sel = g_sl_n - 1;
         g_mode = 1;
@@ -3042,6 +3140,26 @@ static void slice_nudge(int idx, int delta) {
     apply_region();
 }
 
+static void perform_hit(int hit) {
+    if (hit == B_TAB_EDIT) act_set_mode(0);
+    else if (hit == B_TAB_SLICE) act_set_mode(1);
+    else if (hit == B_REC) act_record_toggle();
+    else if (hit == B_PLAY) act_play_toggle();
+    else if (hit == B_STOP) act_stop_press();
+    else if (hit == B_LOOP) act_loop_toggle();
+    else if (hit == B_FX || hit == B_FX_CLOSE) act_fx_toggle();
+    else if (hit == B_CROP) act_crop_tap();
+    else if (hit == B_UNDO) act_undo();
+    else if (hit == B_SAVE) act_save();
+    else if (hit == B_NORM) act_normalize();
+    else if (hit == B_REV) act_reverse_toggle();
+    else if (hit == B_SL_PLUS) act_slice_count(1);
+    else if (hit == B_SL_MINUS) act_slice_count(-1);
+    else if (hit == B_BPM_PLUS) act_bpm_change(1);
+    else if (hit == B_BPM_MINUS) act_bpm_change(-1);
+    else if (hit >= B_PAD0) act_slice_trigger(hit - B_PAD0);
+}
+
 /* ====================================================================
  *  Главная программа
  * ==================================================================== */
@@ -3058,7 +3176,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v1.1");
+    dbg_log("start v1.2");
 
     g_audio = (int16_t *)malloc(MAX_SAMPLES * sizeof(int16_t));
     if (!g_audio) { dbg_log("malloc failed"); sceKernelExitProcess(0); }
@@ -3117,7 +3235,7 @@ int main(void) {
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
-    A.gl_period = 6;
+    A.gl_hz = 6.0f;
 
     /* аудио-потоки: высокий приоритет и отдельные ядра процессора, чтобы рисование их не вытесняло */
     SceUID th_out = sceKernelCreateThread("audio_out", out_thread, 96, 0x10000, 0, 0x40000, NULL);
@@ -3244,30 +3362,31 @@ int main(void) {
                     apply_region();
                     g_error = 0;
                     g_state = ST_PLAYING;
-                    snprintf(msg, sizeof(msg), "GLITCH: hold L, touch the centre of the rear panel to set the rate. Release: back to previous state");
+                    snprintf(msg, sizeof(msg), "GLITCH: hold L, move a finger left/right on the rear panel to set the rate. Release: back to previous state");
                 }
-                {   /* скорость глитча - задняя панель, только центральная зона (по бокам лежат пальцы): выше - чаще */
+                {   /* частота глитча - задняя панель: палец вправо/влево (1..20 Гц), по всей высоте; самые края не используются */
                     SceTouchData bt;
                     memset(&bt, 0, sizeof(bt));
                     sceTouchPeek(SCE_TOUCH_PORT_BACK, &bt, 1);
                     for (unsigned q = 0; q < bt.reportNum && q < 8; q++) {
-                        int bx = bt.report[q].x, by = bt.report[q].y;
-                        if (bx < 640 || bx > 1280 || by < 200 || by > 690) continue;
-                        double tt = (double)(by - 200) / 490.0;                     /* 0 - верх зоны, 1 - низ */
-                        int np2 = 2 + (int)(tt * 10.0 + 0.5);
-                        if (np2 != A.gl_period) {
-                            A.gl_period = np2;
-                            int tenth = (int)(300.0 / (double)np2 + 0.5);        /* циклов вкл-выкл в секунду, x10 */
-                            snprintf(msg, sizeof(msg), "GLITCH rate %d.%d Hz  (rear panel centre: up = faster)", tenth / 10, tenth % 10);
+                        int bx = bt.report[q].x;
+                        if (bx < 330 || bx > 1590) continue;
+                        double tt = (double)(bx - 330) / 1260.0;                      /* 0 - слева, 1 - справа */
+                        float hz = (float)pow(20.0, tt);                              /* 1 .. 20 Гц, на слух равномерно */
+                        if (fabsf(hz - A.gl_hz) > 0.05f * A.gl_hz) {
+                            A.gl_hz = hz;
+                            int tenth = (int)(hz * 10.0f + 0.5f);
+                            snprintf(msg, sizeof(msg), "GLITCH %d.%d Hz  (rear panel: finger left = slower, right = faster)", tenth / 10, tenth % 10);
                         }
                         break;
                     }
                 }
-                if (++A.l_acc >= A.gl_period) { A.l_acc = 0; g_mute = !g_mute; }
+                g_glitch_hz = A.gl_hz;
             }
         } else if (A.l_glitch) {
             A.l_glitch = 0;
             g_mute = 0;
+            g_glitch_hz = 0.0f;
             if (g_state != ST_RECORDING) {
                 if (A.l_pre == ST_PLAYING) { g_error = 0; g_state = ST_PLAYING; }
                 else g_state = ST_IDLE;
@@ -3455,12 +3574,29 @@ int main(void) {
         }
 
         /* ---- касания ---- */
-        sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
+        static SceTouchData tbuf[8];
+        int nb = sceTouchRead(SCE_TOUCH_PORT_FRONT, tbuf, 8);          /* все отсчёты с прошлого кадра, а не только последний */
+        if (nb > 0) touch = tbuf[nb - 1];
+        else { sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1); nb = 0; }
         int nrep = (int)touch.reportNum;
         if (nrep > 6) nrep = 6;
 
         Layout lay_now;
         compute_layout(&lay_now, length, state == ST_RECORDING, split, c1, c2);
+
+        /* очень короткие касания (нажали и отпустили между кадрами) - тоже считаются: иначе быстрый ритм по падам теряет удары */
+        for (int si = 0; si < nb - 1; si++) {
+            for (unsigned q = 0; q < tbuf[si].reportNum && q < 6; q++) {
+                int id = tbuf[si].report[q].id, skip = 0;
+                for (int j = 0; j < A.prev_n && !skip; j++) if (A.prev_ids[j] == id) skip = 1;
+                for (int j = 0; j < nrep && !skip; j++) if (touch.report[j].id == id) skip = 1;
+                for (int e2 = 0; e2 < si && !skip; e2++)
+                    for (unsigned q2 = 0; q2 < tbuf[e2].reportNum && q2 < 6; q2++) if (tbuf[e2].report[q2].id == id) skip = 1;
+                if (skip) continue;
+                int hit = hit_test((int)(tbuf[si].report[q].x / 2), (int)(tbuf[si].report[q].y / 2), g_mode, A.fx_page, g_sl_n);
+                if (hit != B_NONE && hit != B_REC && hit != B_FX_CLOSE) { perform_hit(hit); if (hit == B_SAVE) last_sys = sceKernelGetSystemTimeWide(); }
+            }
+        }
 
         /* новые касания: кнопки, вкладки, пэды, ползунки, начало скраба */
         for (int k = 0; k < nrep; k++) {
@@ -3471,6 +3607,24 @@ int main(void) {
             double fx = touch.report[k].x / 2.0, fy = touch.report[k].y / 2.0;
             int in_wave = (fx >= WAVE_X - 4 && fx <= WAVE_X + WAVE_W + 4 && fy >= WAVE_Y - 18 && fy <= WAVE_Y + WAVE_H + 18);
 
+            if (in_wave && g_mode == 1 && !A.fx_page && !A.sdrag_on && !A.scrubbing && g_state != ST_RECORDING
+                && length > 1 && fy < WAVE_Y + 46) {
+                int bi2 = -1, bsg = 0; double bd2 = 28.0;
+                for (int i2 = 1; i2 < g_sl_n; i2++)
+                    for (int sg = 0; sg < lay_now.nseg; sg++) {
+                        int mxp = sample_to_x(&lay_now, sg, (double)g_sl_pos[i2]);
+                        if (mxp == -1000000) continue;
+                        double d = fabs(fx - (double)mxp);
+                        if (d < bd2) { bd2 = d; bi2 = i2; bsg = sg; }
+                    }
+                if (bi2 > 0) {
+                    A.sdrag_on = 1; A.sdrag_id = id; A.sdrag_idx = bi2; A.sdrag_x0 = fx;
+                    A.sdrag_c0 = (double)g_sl_pos[bi2];
+                    A.sdrag_spp = (double)lay_now.vl[bsg] / (double)lay_now.w[bsg];
+                    snprintf(msg, sizeof(msg), "Dragging slice boundary %d", bi2);
+                    continue;
+                }
+            }
             if (in_wave && g_mode == 0 && !A.fx_page && !A.scrubbing && g_state != ST_RECORDING
                 && length > 1 && fy < WAVE_Y + 46) {
                 int best = -1, bseg = 0; double bd = 28.0;
@@ -3533,21 +3687,9 @@ int main(void) {
             if (hit != B_NONE) {
                 A.btn_down = hit;
                 A.btn_id = id;
-                if (hit == B_TAB_EDIT) act_set_mode(0);
-                else if (hit == B_TAB_SLICE) act_set_mode(1);
-                else if (hit == B_REC) act_record_toggle();
-                else if (hit == B_PLAY) act_play_toggle();
-                else if (hit == B_STOP) act_stop_press();
-                else if (hit == B_LOOP) act_loop_toggle();
-                else if (hit == B_FX || hit == B_FX_CLOSE) act_fx_toggle();
-                else if (hit == B_CROP) act_crop_tap();
-                else if (hit == B_UNDO) act_undo();
-                else if (hit == B_SAVE) { act_save(); last_sys = sceKernelGetSystemTimeWide(); }
-                else if (hit == B_NORM) act_normalize();
-                else if (hit == B_REV) act_reverse_toggle();
-                else if (hit == B_SL_PLUS) act_slice_count(1);
-                else if (hit == B_SL_MINUS) act_slice_count(-1);
-                else if (hit >= B_PAD0) act_slice_trigger(hit - B_PAD0);
+                A.btn_hold = 0;
+                perform_hit(hit);
+                if (hit == B_SAVE) last_sys = sceKernelGetSystemTimeWide();
                 continue;
             }
 
@@ -3562,7 +3704,7 @@ int main(void) {
         }
 
         /* уже идущие касания */
-        int scrub_alive = 0, menu_alive = 0, btn_alive = 0, drag_alive[3] = { 0, 0, 0 };
+        int scrub_alive = 0, menu_alive = 0, btn_alive = 0, sdrag_alive = 0, drag_alive[3] = { 0, 0, 0 };
         for (int k = 0; k < nrep; k++) {
             int id = touch.report[k].id;
             double fx = touch.report[k].x / 2.0;
@@ -3587,16 +3729,28 @@ int main(void) {
                 /* скорость определяется расстоянием от пальца до линии воспроизведения:
                  * рядом - ровно 1.0x, дальше - быстрее (до x2), направление - в сторону пальца */
                 double dtc = tdt < 0.0 ? 0.0 : (tdt > 0.05 ? 0.05 : tdt);
-                double dpx = (target - A.scrub_head) / spp_seg;           /* своя модель линии: позиция из звука приходит ступеньками */
+                double d_smp = target - A.scrub_head;                      /* своя модель линии: позиция из звука приходит ступеньками */
+                double dpx = d_smp / spp_seg;
                 double r = scrub_profile(dpx);
-                A.scrub_head += r * (double)SAMPLE_RATE * dtc;
-                A.scrub_head += ((double)g_play_pos - A.scrub_head) * 0.04;
+                double lim = fabs(d_smp) / (0.03 * (double)SAMPLE_RATE);   /* "пружина": у самого пальца замедляемся, без перелёта и качания */
+                if (fabs(r) > lim) r = (r < 0.0 ? -lim : lim);
+                double stp = r * (double)SAMPLE_RATE * dtc;
+                if (fabs(stp) > fabs(d_smp)) stp = d_smp;
+                A.scrub_head += stp;
+                if (fabs((double)g_play_pos - A.scrub_head) > 0.3 * (double)SAMPLE_RATE)
+                    A.scrub_head += ((double)g_play_pos - A.scrub_head) * 0.1;      /* подстраховка от долгого расхождения
+                                                                                   */
                 if (A.scrub_head < 0.0) A.scrub_head = 0.0;
                 if (A.scrub_head > (double)(length - 1)) A.scrub_head = (double)(length - 1);
                 g_scrub_target = (float)target;
                 g_scrub_vel = (float)(r * (double)SAMPLE_RATE);
                 A.scrub_speed = r * (double)SAMPLE_RATE;
                 (void)vp;
+            }
+            if (A.sdrag_on && id == A.sdrag_id) {
+                sdrag_alive = 1;
+                int want = (int)(A.sdrag_c0 + (fx - A.sdrag_x0) * A.sdrag_spp);
+                slice_nudge(A.sdrag_idx, want - g_sl_pos[A.sdrag_idx]);
             }
             for (int w = 0; w < 3; w++) {
                 if (!A.drag_on[w] || id != A.drag_id[w]) continue;
@@ -3623,10 +3777,15 @@ int main(void) {
             }
             if (A.btn_down != B_NONE && id == A.btn_id) {
                 btn_alive = 1;
-                if (A.btn_down == B_REV && ++A.rev_hold == 40) {        /* удержание: "запечь" реверс в сам звук */
+                A.btn_hold++;
+                if (A.btn_down == B_REV && A.btn_hold == 40) {          /* удержание: "запечь" реверс в сам звук */
                     if (g_rev_req) act_reverse_toggle();                /* снять временный режим */
                     act_reverse();
                 }
+                if ((A.btn_down == B_BPM_PLUS || A.btn_down == B_BPM_MINUS) && A.btn_hold > 24 && A.btn_hold % 4 == 0)
+                    act_bpm_change((A.btn_down == B_BPM_PLUS ? 1 : -1) * (A.btn_hold > 90 ? 2 : 1));
+                if ((A.btn_down == B_SL_PLUS || A.btn_down == B_SL_MINUS) && A.btn_hold > 24 && A.btn_hold % 8 == 0)
+                    act_slice_count(A.btn_down == B_SL_PLUS ? 1 : -1);
             }
         }
         if (A.scrubbing && !scrub_alive) {
@@ -3645,10 +3804,11 @@ int main(void) {
             }
             dbg_log("scrub end %d", endpos);
         }
+        if (A.sdrag_on && !sdrag_alive) A.sdrag_on = 0;
         for (int w = 0; w < 3; w++)
             if (A.drag_on[w] && !drag_alive[w]) { A.drag_on[w] = 0; request_autosave(length, 0); }
         if (A.menu_touch_row >= 0 && !menu_alive) A.menu_touch_row = -1;
-        if (A.btn_down != B_NONE && !btn_alive) { A.btn_down = B_NONE; A.btn_id = -1; A.rev_hold = 0; }
+        if (A.btn_down != B_NONE && !btn_alive) { A.btn_down = B_NONE; A.btn_id = -1; A.btn_hold = 0; }
         A.prev_n = nrep;
         for (int k = 0; k < nrep; k++) A.prev_ids[k] = touch.report[k].id;
 
@@ -3664,7 +3824,7 @@ int main(void) {
         /* текстура волны обновляется только при изменениях */
         {
             int peak = g_peak_all;
-            int newkey[8] = { length, live, peak, lay_now.nseg, 0, 0, 0, 0 };
+            int newkey[8] = { length, live, peak, lay_now.nseg, g_audio_ver, 0, 0, 0 };
             int changed = live || memcmp(key, newkey, sizeof(key)) != 0 ||
                           memcmp(&lay_last, &lay_now, sizeof(Layout)) != 0;
             if (changed) {
@@ -3710,7 +3870,7 @@ int main(void) {
         /* ---- данные для рисования ---- */
         UiState u;
         memset(&u, 0, sizeof(u));
-        u.legend = g_legend; u.rev = g_rev_req; u.bpm = g_sl_bpm; u.mode = g_mode; u.fx_page = A.fx_page; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
+        u.legend = g_legend; u.rev = g_rev_req; u.bpm = g_sl_bpm; u.bpm_t = g_bpm_target; u.bpm_b = g_bpm_base; u.mode = g_mode; u.fx_page = A.fx_page; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
         u.length = length; u.playhead = playhead; u.live = live;
         u.split = split; u.active = active; u.c1 = c1; u.c2 = c2;
         u.menu_sel = A.menu_sel;
