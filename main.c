@@ -162,6 +162,7 @@ static volatile int g_error = 0;
 static volatile int g_out_ch = 0;
 static volatile int g_discard = 0;
 static volatile int g_scrub = 0;
+static volatile int g_rev = 0, g_rev_req = 0;   /* обратное воспроизведение области (g_rev применяется вместе с областью) */
 static volatile int g_mute = 0;            /* глитч: звук выключается, воспроизведение идёт дальше */
 static volatile int g_rate_only = 1;       /* скраб управляется только скоростью (без подтяжки к позиции) */
 static volatile int g_loop = 0;
@@ -311,7 +312,7 @@ typedef struct {
     int scrub;
     float volume;
     double scrub_target, scrub_vel;
-    int mute, rate_only;
+    int mute, rate_only, rev;
 } Params;
 
 static void engine_reset(Engine *e, double pos) {
@@ -321,7 +322,11 @@ static void engine_reset(Engine *e, double pos) {
     e->ppos = pos;
 }
 
+static int g_mir = 0;                    /* поток звука: читаем зеркально внутри области */
+static double g_mir_c = 0.0;
+
 static inline float rd_clamped(const int16_t *a, int len, double pos) {
+    if (g_mir) pos = g_mir_c - pos;
     if (pos < 0.0) pos = 0.0;
     if (pos > (double)(len - 1)) pos = (double)(len - 1);
     int i = (int)pos;
@@ -371,6 +376,7 @@ static inline float fetch(const int16_t *a, int len, int lo, int hi, int loop, i
     } else if (idx >= hi) {
         return 0.0f;
     }
+    if (g_mir) idx = (int)g_mir_c - idx;
     if (idx < 0 || idx >= len) return 0.0f;
     return (float)a[idx];
 }
@@ -428,6 +434,8 @@ static int engine_render(Engine *e, const int16_t *a, int len, const Params *p,
     const int do_hold = p->crush_hz < (float)SAMPLE_RATE - 0.5f;
     const float hold_inc = p->crush_hz / (float)OUT_RATE;
     const int mode = p->scrub ? 0 : (p->neutral ? 1 : 2);
+    g_mir = (p->rev && !p->scrub) ? 1 : 0;
+    g_mir_c = (double)(p->lo + p->hi - 1);
     int ended = 0, peak = 0;
 
     /* склейка петли в обычном режиме */
@@ -727,19 +735,23 @@ static int out_thread(SceSize args, void *argp) {
         }
 
         /* область и перемотка читаются согласованно (пэды меняют обе величины одновременно) */
-        int lo, hi, seek;
+        int lo, hi, seek, rev;
         for (;;) {
             unsigned q1 = g_rg_seq;
             __sync_synchronize();
-            lo = g_lo; hi = g_hi; seek = g_seek_to;
+            lo = g_lo; hi = g_hi; seek = g_seek_to; rev = g_rev;
             __sync_synchronize();
             if (q1 == g_rg_seq && !(q1 & 1u)) break;
         }
         region_sanitize(&lo, &hi, len);
+        const int scrub_now = g_scrub;
+        const int mirror_now = rev && !scrub_now;
+        const double mc = (double)(lo + hi - 1);
 
         if (!was_playing) {
             double p0 = (double)g_play_pos;
-            if (p0 < (double)lo || p0 >= (double)hi) p0 = (double)lo;
+            if (p0 < (double)lo || p0 >= (double)hi) p0 = rev ? (double)(hi - 1) : (double)lo;
+            if (mirror_now) p0 = mc - p0;
             engine_reset(&eng, p0);
             was_playing = 1;
         }
@@ -752,12 +764,14 @@ static int out_thread(SceSize args, void *argp) {
                 prm_old = prm_prev;
                 old_active = 2;
             }
-            engine_reset(&eng, (double)seek);
+            engine_reset(&eng, mirror_now ? mc - (double)seek : (double)seek);
             __sync_bool_compare_and_swap(&g_seek_to, seek, -1);   /* если пришла новая перемотка - не затираем */
         }
 
         Params prm;
         load_params(&prm, lo, hi);
+        prm.scrub = scrub_now;
+        prm.rev = rev;
         int peak = 0;
         int ended = engine_render(&eng, g_audio, len, &prm, mono, &peak);
         prm_prev = prm;
@@ -802,11 +816,12 @@ static int out_thread(SceSize args, void *argp) {
         g_level = peak;
 
         if (ended) {
-            g_play_pos = lo;
+            g_play_pos = rev ? hi - 1 : lo;
             was_playing = 0;
             __sync_bool_compare_and_swap(&g_state, ST_PLAYING, ST_IDLE);
         } else if (g_state == ST_PLAYING) {
-            g_play_pos = (int)engine_pos(&eng);
+            double ep = engine_pos(&eng);
+            g_play_pos = (int)(mirror_now ? mc - ep : ep);
         }
     }
 
@@ -1249,6 +1264,75 @@ static int refine_onset(const int16_t *a, int len, int frame) {
     return best;
 }
 
+/* ---------- Темп сэмпла: автокорреляция "новизны" внутри области ---------- */
+static int g_sl_bpm = 0;                      /* 0 - темп не определён */
+
+static int snap_zero(const int16_t *a, int len, int x) {
+    int best = x, bestd = 1 << 30;
+    for (int d = -40; d <= 40; d++) {
+        int i = x + d;
+        if (i < 1 || i >= len - 1) continue;
+        if (a[i - 1] <= 0 && a[i] > 0 && abs(d) < bestd) { bestd = abs(d); best = i; }
+    }
+    return best;
+}
+
+/* возвращает 1, если темп уверенный; T - период в сэмплах, g0 - позиция одной из долей */
+static int tempo_estimate(int rlo, int rhi, double *T_smp, double *g0_smp) {
+    static float x[ON_MAXF];
+    int f0 = rlo / ON_HOP, f1 = rhi / ON_HOP;
+    if (f1 > g_nov_frames) f1 = g_nov_frames;
+    int n = f1 - f0;
+    g_sl_bpm = 0;
+    if (n < 300) return 0;                                  /* меньше ~2.4 с - темп не определить */
+    double mean = 0.0;
+    for (int i = 0; i < n; i++) mean += g_nov[f0 + i];
+    mean /= (double)n;
+    double e0 = 0.0;
+    for (int i = 0; i < n; i++) { x[i] = g_nov[f0 + i] - (float)mean; e0 += (double)x[i] * x[i]; }
+    if (e0 < 1e-6) return 0;
+    e0 /= (double)n;
+    int lmin = 40, lmax = 110;                              /* 187..68 уд/мин при 125 кадрах/с */
+    if (lmax > n / 3) lmax = n / 3;
+    double best = -1e9, ac_best = 0.0; int bl = 0;
+    static double acs[130];
+    for (int lag = lmin - 1; lag <= lmax + 1 && lag < 128; lag++) {
+        double a = 0.0;
+        for (int i = 0; i + lag < n; i++) a += (double)x[i] * x[i + lag];
+        acs[lag] = a / (double)(n - lag);
+    }
+    for (int lag = lmin; lag <= lmax; lag++) {
+        double a2 = 0.0;
+        if (2 * lag < n) {
+            for (int i = 0; i + 2 * lag < n; i++) a2 += (double)x[i] * x[i + 2 * lag];
+            a2 /= (double)(n - 2 * lag);
+        }
+        double sc = acs[lag] + 0.5 * a2;
+        if (sc > best) { best = sc; bl = lag; ac_best = acs[lag]; }
+    }
+    if (bl == 0 || ac_best / e0 < 0.18) return 0;          /* биение выражено слабо */
+    double Tf = (double)bl;
+    {   /* уточнение периода параболой */
+        double ym = acs[bl - 1], y0 = acs[bl], yp = acs[bl + 1];
+        double den = ym - 2.0 * y0 + yp;
+        if (den < -1e-12) Tf += 0.5 * (ym - yp) / den;
+    }
+    /* фаза: смещение сетки, при котором на доли попадает больше новизны */
+    double bestsum = -1e30; int bph = 0;
+    for (int ph = 0; ph < bl; ph++) {
+        double sum = 0.0;
+        for (double p = (double)ph; p < (double)n - 1.0; p += Tf) sum += x[(int)(p + 0.5)];
+        if (sum > bestsum) { bestsum = sum; bph = ph; }
+    }
+    double bpm = 60.0 * (16000.0 / (double)ON_HOP) / Tf;
+    while (bpm < 80.0) bpm *= 2.0;
+    while (bpm > 165.0) bpm *= 0.5;
+    g_sl_bpm = (int)(bpm + 0.5);
+    *T_smp = Tf * (double)ON_HOP;
+    *g0_smp = (double)(f0 + bph) * (double)ON_HOP;
+    return 1;
+}
+
 /* Расставить n регионов (n = SL_MIN..SL_MAX). Заполняет g_sl_pos / g_sl_n. */
 static void slices_pick(int n, const int16_t *a, int rlo, int rhi) {
     static OnsetCand cand[ON_MAXF];
@@ -1282,6 +1366,25 @@ static void slices_pick(int n, const int16_t *a, int rlo, int rhi) {
     }
     qsort(pos, (size_t)np, sizeof(int), int_cmp);
 
+    /* подгон под темп: границы, близкие к долям, садятся точно на сетку */
+    double Ts = 0.0, G0 = 0.0;
+    int have_grid = tempo_estimate(rlo, rhi, &Ts, &G0);
+    if (have_grid) {
+        for (int j = 0; j < np; j++) {
+            double k = floor(((double)pos[j] - G0) / Ts + 0.5);
+            double g = G0 + k * Ts;
+            if (fabs((double)pos[j] - g) <= 0.12 * Ts) pos[j] = snap_zero(a, g_length, (int)(g + 0.5));
+        }
+        qsort(pos, (size_t)np, sizeof(int), int_cmp);
+        int m = 0;                                          /* после сдвига убираем слишком близкие и вышедшие за область */
+        for (int j = 0; j < np; j++) {
+            if (pos[j] < rlo + SL_MIN_LEN || pos[j] > rhi - SL_MIN_LEN) continue;
+            if (m > 0 && pos[j] - pos[m - 1] < SL_MIN_LEN) continue;
+            pos[m++] = pos[j];
+        }
+        np = m;
+    }
+
     /* если звуков меньше, чем запрошено регионов, делим самые длинные регионы пополам */
     while (np < n - 1) {
         int bestgap = 0, bestat = -1, prev = rlo;
@@ -1293,6 +1396,11 @@ static void slices_pick(int n, const int16_t *a, int rlo, int rhi) {
         if (bestgap < 2 * SL_MIN_LEN) break;
         int start = (bestat == 0) ? rlo : pos[bestat - 1];
         int mid = start + bestgap / 2;
+        if (have_grid) {                                    /* делим по ближайшей доле, а не ровно пополам */
+            double k = floor(((double)mid - G0) / Ts + 0.5);
+            int gm = (int)(G0 + k * Ts + 0.5);
+            if (gm > start + SL_MIN_LEN && gm < start + bestgap - SL_MIN_LEN) mid = snap_zero(a, g_length, gm);
+        }
         for (int j = np; j > bestat; j--) pos[j] = pos[j - 1];
         pos[bestat] = mid;
         np++;
@@ -1451,8 +1559,9 @@ static void render_wave(vita2d_texture *tex, const Layout *L, int length, int li
 
     int peak = g_peak_all;
     if (peak < 3000) peak = 3000;
-    float gain = 32768.0f / (float)peak;
-    if (gain > 8.0f) gain = 8.0f;
+    float gain = 0.8f * 32768.0f / (float)peak;      /* лёгкий подъём тихих записей, но не до упора: громкость видна */
+    if (gain > 3.0f) gain = 3.0f;
+    if (gain < 1.0f) gain = 1.0f;
 
     uint32_t col = live ? K_WAVE_REC : K_WAVE;
     int nb = length / IN_GRAIN;
@@ -1859,7 +1968,7 @@ typedef struct {
     char msg[160];
     int sl_n, sl_sel, sl_flash, sl_playing;
     int btn_down, can_undo;
-    int crop_armed, legend;
+    int crop_armed, legend, rev, bpm;
     double scrub_pos, scrub_speed;
     unsigned frame;
     Layout lay;
@@ -2013,6 +2122,7 @@ static int edit_style(const UiState *u, int id) {
     if (id == B_LOOP && u->loop) style = 1;
     if (id == B_FX && u->fx_page) style = 1;
     if (id == B_CROP && u->crop_armed) style = 1;
+    if (id == B_REV && u->rev) style = 1;
     return style;
 }
 
@@ -2137,7 +2247,8 @@ static int ctl_update(Canvas *c, const UiState *u) {
  *  Текстуры интерфейса и их обновление
  * ==================================================================== */
 static vita2d_texture *g_tex_bg = NULL, *g_tex_top[2], *g_tex_ctl[3];
-static Canvas g_cv_bg, g_cv_top, g_cv_ctl;
+static Canvas g_cv_bg, g_cv_top, g_cv_page[3];          /* панель управления: по холсту на страницу (EDIT, SLICE, FX) */
+static int g_wcodes[3][W_COUNT], g_page_keys[3] = { -1, -1, -1 }, g_last_page = -1;
 static uint32_t g_sig_top = 0, g_sig_ctl = 0;
 static int g_top_cur = -1, g_ctl_cur = -1, g_top_next = 0, g_ctl_next = 0;
 
@@ -2151,8 +2262,12 @@ static void upload_canvas(vita2d_texture *tex, const Canvas *c) {
 static int ui_init(void) {
     g_cv_bg.w = SCR_W; g_cv_bg.h = SCR_H; g_cv_bg.px = (uint32_t *)malloc((size_t)SCR_W * SCR_H * 4);
     g_cv_top.w = SCR_W; g_cv_top.h = TOP_H; g_cv_top.px = (uint32_t *)malloc((size_t)SCR_W * TOP_H * 4);
-    g_cv_ctl.w = SCR_W; g_cv_ctl.h = CTL_TH; g_cv_ctl.px = (uint32_t *)malloc((size_t)SCR_W * CTL_TH * 4);
-    if (!g_cv_bg.px || !g_cv_top.px || !g_cv_ctl.px) return 0;
+    for (int i = 0; i < 3; i++) {
+        g_cv_page[i].w = SCR_W; g_cv_page[i].h = CTL_TH;
+        g_cv_page[i].px = (uint32_t *)calloc((size_t)SCR_W * CTL_TH, 4);
+        g_page_keys[i] = -1;
+    }
+    if (!g_cv_bg.px || !g_cv_top.px || !g_cv_page[0].px || !g_cv_page[1].px || !g_cv_page[2].px) return 0;
     g_tex_bg = vita2d_create_empty_texture(SCR_W, SCR_H);
     for (int i = 0; i < 2; i++) g_tex_top[i] = vita2d_create_empty_texture(SCR_W, TOP_H);
     for (int i = 0; i < 3; i++) g_tex_ctl[i] = vita2d_create_empty_texture(SCR_W, CTL_TH);
@@ -2160,7 +2275,7 @@ static int ui_init(void) {
     upload_canvas(g_tex_bg, &g_cv_bg);
     g_sig_top = g_sig_ctl = 0xFFFFFFFFu;
     g_top_cur = g_ctl_cur = -1;
-    g_page_key = -1;
+    g_last_page = -1;
     return 1;
 }
 
@@ -2179,7 +2294,7 @@ static void ui_recreate(void) {
     upload_canvas(g_tex_bg, &g_cv_bg);
     g_sig_top = g_sig_ctl = 0xFFFFFFFFu;
     g_top_cur = g_ctl_cur = -1;
-    g_page_key = -1;
+    g_last_page = -1;
 }
 
 static inline uint32_t sig_add(uint32_t h, uint32_t v) { h ^= v; return h * 16777619u; }
@@ -2196,9 +2311,18 @@ static void ui_update_textures(const UiState *u) {
         g_top_cur = g_top_next; g_top_next = (g_top_next + 1) % 2;
         upload_canvas(g_tex_top[g_top_cur], &g_cv_top);
     }
-    if (ctl_update(&g_cv_ctl, u) || g_ctl_cur < 0) {
-        g_ctl_cur = g_ctl_next; g_ctl_next = (g_ctl_next + 1) % 3;
-        upload_canvas(g_tex_ctl[g_ctl_cur], &g_cv_ctl);
+    {   /* у каждой страницы свой холст: при переключении ничего не перерисовывается заново */
+        int page = u->fx_page ? 2 : (u->mode == 0 ? 0 : 1);
+        memcpy(g_wcode, g_wcodes[page], sizeof(g_wcode));
+        g_page_key = g_page_keys[page];
+        int ch = ctl_update(&g_cv_page[page], u);
+        memcpy(g_wcodes[page], g_wcode, sizeof(g_wcode));
+        g_page_keys[page] = g_page_key;
+        if (ch || page != g_last_page || g_ctl_cur < 0) {
+            g_last_page = page;
+            g_ctl_cur = g_ctl_next; g_ctl_next = (g_ctl_next + 1) % 3;
+            upload_canvas(g_tex_ctl[g_ctl_cur], &g_cv_page[page]);
+        }
     }
 }
 
@@ -2220,6 +2344,7 @@ static void draw_overlays(const UiState *u) {
             int sx = xa == -1000000 ? segx : xa;
             int ex = xb == -1000000 ? segx + segw : xb;
             rect(sx, WAVE_Y, ex - sx, WAVE_H, u->loop ? RGBA8(120, 230, 140, 40) : RGBA8(255, 200, 110, 34));
+            if (u->rev && ex - sx > 90) text(sx + 22, WAVE_Y + 14, K_YELLOW, 0.8f, "<< REVERSE <<");
         }
         for (int k = 0; k < 2; k++) {
             double cs = (k == 0) ? u->c1 : u->c2;
@@ -2292,6 +2417,36 @@ static void draw_ticks(const UiState *u) {
     }
 }
 
+/* шкала времени вдоль нижнего края волны */
+static void draw_time_axis(const UiState *u) {
+    const Layout *L = &u->lay;
+    if (u->length <= 0 || u->live) return;
+    static const double steps[] = { 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300 };
+    const int n = (int)(sizeof(steps) / sizeof(steps[0]));
+    for (int sg = 0; sg < L->nseg; sg++) {
+        int vs = L->vs[sg], vl = L->vl[sg], w = L->w[sg];
+        if (vl <= 0) continue;
+        double px_per_s = (double)SAMPLE_RATE * (double)w / (double)vl;
+        double step = steps[n - 1];
+        for (int i = 0; i < n; i++) if (steps[i] * px_per_s >= 84.0) { step = steps[i]; break; }
+        double t0 = (double)vs / (double)SAMPLE_RATE, t1 = (double)(vs + vl) / (double)SAMPLE_RATE;
+        long long k0 = (long long)ceil(t0 / step - 1e-9);
+        for (long long k = k0; (double)k * step <= t1 && k - k0 < 14; k++) {
+            double t = (double)k * step;
+            int x = WAVE_X + L->x0[sg] + (int)((t * (double)SAMPLE_RATE - (double)vs) * (double)w / (double)vl);
+            if (x < WAVE_X + L->x0[sg] || x > WAVE_X + L->x0[sg] + w - 30) continue;
+            char lb[24];
+            if (t >= 60.0) snprintf(lb, sizeof(lb), "%d:%02d", (int)(t / 60.0), (int)fmod(t, 60.0));
+            else if (step >= 1.0) snprintf(lb, sizeof(lb), "%ds", (int)(t + 0.5));
+            else if (step >= 0.1) snprintf(lb, sizeof(lb), "%.1fs", t);
+            else if (step >= 0.01) snprintf(lb, sizeof(lb), "%.2fs", t);
+            else snprintf(lb, sizeof(lb), "%.3fs", t);
+            rect(x, WAVE_Y + WAVE_H - 7, 1, 7, RGBA8(255, 220, 160, 170));
+            text(x + 3, WAVE_Y + WAVE_H - 3, RGBA8(255, 220, 160, 200), 0.62f, lb);
+        }
+    }
+}
+
 static int g_legend = 0;
 
 static void ui_draw(const UiState *u) {
@@ -2302,7 +2457,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя панель: название и вкладки */
     text(62, 30, K_BROWN, 1.25f, "VITA SAMPLER");
-    text(62, 44, K_BROWN_LO, 0.62f, "SAMPLER / LOOPER   v1.0");
+    text(62, 44, K_BROWN_LO, 0.62f, "SAMPLER / LOOPER   v1.1");
     text_c(384 + 46, 31, u->mode == 0 ? K_CREAM_HI : K_BROWN, 0.95f, "EDIT");
     text_c(484 + 46, 31, u->mode == 1 ? K_CREAM_HI : K_BROWN, 0.95f, "SLICE");
     text(622, 31, u->loop ? RGBA8(160, 240, 170, 255) : K_BROWN_LO, 0.9f, "LOOP");
@@ -2345,11 +2500,15 @@ static void ui_draw(const UiState *u) {
     if (!u->live && u->length > 1) {
         if (u->mode == 0) draw_overlays(u); else draw_slice_overlays(u);
         draw_ticks(u);
+        draw_time_axis(u);
         if (u->mode == 0)
             snprintf(buf, sizeof(buf), "A %d    B %d    region %d smp    active: %c", (int)u->c1, (int)u->c2, (int)(u->c2 - u->c1), u->active == 0 ? 'A' : 'B');
-        else
-            snprintf(buf, sizeof(buf), "slice %d / %d    start %d    length %d smp", u->sl_sel + 1, u->sl_n,
-                     g_sl_pos[u->sl_sel], g_sl_pos[u->sl_sel + 1] - g_sl_pos[u->sl_sel]);
+        else {
+            snprintf(buf, sizeof(buf), "slice %d / %d    start %d    length %d smp    %s", u->sl_sel + 1, u->sl_n,
+                     g_sl_pos[u->sl_sel], g_sl_pos[u->sl_sel + 1] - g_sl_pos[u->sl_sel],
+                     u->bpm > 0 ? "tempo ~" : "");
+            if (u->bpm > 0) { char bb[24]; snprintf(bb, sizeof(bb), "%d BPM", u->bpm); strncat(buf, bb, sizeof(buf) - strlen(buf) - 1); }
+        }
         text(WAVE_X, 296, K_AMBER_DIM, 0.8f, buf);
     }
     if (u->live) text(WAVE_X, 296, K_AMBER_DIM, 0.8f, "live view: last 8 seconds");
@@ -2405,18 +2564,19 @@ static void ui_draw(const UiState *u) {
         rect_outline(24, 58, 912, 254, 2, K_ORANGE_LO);
         static const char *L[] = {
             "CONTROLS                                                              (SELECT closes)",
-            "R  record / stop       L  play / pause  (hold L = glitch: sound gate, right stick up/down = rate)",
+            "R  record / stop       L  play / pause  (hold L = glitch gate; rear panel centre up/down = rate)",
             "TRIANGLE  stop (hold = keep position)      SQUARE  loop      CIRCLE  effects",
             "START  save WAV   SELECT  help   SELECT+LEFT/RIGHT  EDIT/SLICE   SELECT+START hold  exit   TRIANGLE x2  reset A-B",
             "EDIT   sticks move cursors A / B      both sticks up / down = zoom in / out",
             "       D-pad left/right = active cursor      D-pad up/down = zoom      X hold = crop to A-B",
             "       touch the top of the wave: next to A or B and drag = move it (two fingers ok); inside A-B = move both",
+            "       REVERSE toggles backwards playback (hold = bake into the sample)   NORMALIZE: region A-B to full level",
             "       touch the wave lower down = scrub: finger near the line = 1x, farther = faster (max x2)",
             "SLICE  regions are built inside A-B chosen in EDIT      X  play slice",
             "       sticks nudge slice start / end      D-pad left/right = pick slice, up/down = count",
             "MENU   D-pad up/down row, left/right value, left stick, touch sliders, X reset (hold = all)"
         };
-        for (int i = 0; i < 11; i++) text(40, 82 + i * 21, i == 0 ? K_YELLOW : K_AMBER_LT, 0.82f, L[i]);
+        for (int i = 0; i < 12; i++) text(40, 80 + i * 20, i == 0 ? K_YELLOW : K_AMBER_LT, 0.82f, L[i]);
     }
 }
 
@@ -2495,6 +2655,8 @@ typedef struct {
     int crop_armed; unsigned crop_frame;
     int tri_active, tri_frames, tri_pos;
     unsigned tri_last;
+    int rev_hold, gl_period;
+    double scrub_head;
     int scrubbing, scrub_id, resume_state, scrub_seg;
     double scrub_pos, scrub_speed, mk_frac[2];
     ScrubTrack st;
@@ -2514,7 +2676,7 @@ static App A;
 static void region_publish(int lo, int hi, int seek) {
     g_rg_seq++;
     __sync_synchronize();
-    g_lo = lo; g_hi = hi;
+    g_lo = lo; g_hi = hi; g_rev = g_rev_req;
     if (seek >= 0) g_seek_to = seek;
     __sync_synchronize();
     g_rg_seq++;
@@ -2590,6 +2752,7 @@ static void act_record_toggle(void) {
     stop_scrub_state();
     sceKernelDelayThread(60000);
     for (int w = 0; w < 300 && (g_save_req || g_save_busy); w++) sceKernelDelayThread(10000);
+    g_rev_req = 0; g_rev = 0;
     g_length = 0;
     g_play_pos = 0;
     g_seek_to = -1;
@@ -2634,7 +2797,7 @@ static void act_stop_press(void) {
     apply_region();
     int lo = g_lo, hi = g_hi;
     region_sanitize(&lo, &hi, g_length);
-    g_play_pos = lo;
+    g_play_pos = g_rev ? hi - 1 : lo;
     g_seek_to = -1;
     snprintf(msg, sizeof(msg), g_mode == 0 ? "Stopped - next play starts from A   (hold TRIANGLE to keep the position)"
                                            : "Stopped - next play starts from the slice start");
@@ -2708,6 +2871,16 @@ static void edit_finish(const char *text) {
     dirty = 1;
     request_autosave(g_length, 1);
     snprintf(msg, sizeof(msg), "%s   (UNDO: %d step%s)", text, g_un, g_un == 1 ? "" : "s");
+}
+
+static void act_reverse_toggle(void) {
+    if (g_mode != 0 || g_state == ST_RECORDING || g_length < 16) return;
+    apply_region();
+    g_rev_req = !g_rev_req;
+    int seek = (g_state == ST_PLAYING && !g_scrub) ? g_play_pos : -1;     /* позиция на экране остаётся прежней */
+    region_publish(g_lo, g_hi, seek);
+    snprintf(msg, sizeof(msg), g_rev_req ? "REVERSE ON: region plays backwards (hold the button = bake into the sample)"
+                                          : "Reverse off");
 }
 
 static void act_reverse(void) {
@@ -2831,6 +3004,7 @@ static void slice_view_fit(int length) {
 static void act_set_mode(int m) {
     if (m == g_mode) return;
     if (g_state == ST_RECORDING) return;
+    g_rev_req = 0; g_rev = 0;
     if (m == 1) {
         if (g_length < 4 * SL_MIN_LEN) { snprintf(msg, sizeof(msg), "Record a longer sample first (at least 0.4 s)"); return; }
         int rlo = (int)c1, rhi = (int)c2;
@@ -2844,7 +3018,8 @@ static void act_set_mode(int m) {
         split = 0;
         slice_view_fit(length_now());
         apply_region();
-        snprintf(msg, sizeof(msg), "SLICE mode: %d regions - tap a pad to play from there", g_sl_n);
+        if (g_sl_bpm > 0) snprintf(msg, sizeof(msg), "SLICE mode: %d regions, tempo ~%d BPM (cuts near beats snap to the grid)", g_sl_n, g_sl_bpm);
+        else snprintf(msg, sizeof(msg), "SLICE mode: %d regions - tap a pad to play from there", g_sl_n);
     } else {
         g_mode = 0;
         view_reset_full(g_length);
@@ -2883,7 +3058,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v1.0");
+    dbg_log("start v1.1");
 
     g_audio = (int16_t *)malloc(MAX_SAMPLES * sizeof(int16_t));
     if (!g_audio) { dbg_log("malloc failed"); sceKernelExitProcess(0); }
@@ -2941,6 +3116,8 @@ int main(void) {
 
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
+    A.gl_period = 6;
 
     /* аудио-потоки: высокий приоритет и отдельные ядра процессора, чтобы рисование их не вытесняло */
     SceUID th_out = sceKernelCreateThread("audio_out", out_thread, 96, 0x10000, 0, 0x40000, NULL);
@@ -3067,13 +3244,26 @@ int main(void) {
                     apply_region();
                     g_error = 0;
                     g_state = ST_PLAYING;
-                    snprintf(msg, sizeof(msg), "GLITCH: hold L, right stick up/down = rate. Release: back to previous state");
+                    snprintf(msg, sizeof(msg), "GLITCH: hold L, touch the centre of the rear panel to set the rate. Release: back to previous state");
                 }
-                float ry = ((float)(128 - (int)pad.ry)) / 128.0f;     /* вверх - чаще */
-                int period = 7 - (int)(ry * 5.0f + (ry > 0 ? 0.5f : -0.5f));
-                if (period < 2) period = 2;
-                if (period > 12) period = 12;
-                if (++A.l_acc >= period) { A.l_acc = 0; g_mute = !g_mute; }
+                {   /* скорость глитча - задняя панель, только центральная зона (по бокам лежат пальцы): выше - чаще */
+                    SceTouchData bt;
+                    memset(&bt, 0, sizeof(bt));
+                    sceTouchPeek(SCE_TOUCH_PORT_BACK, &bt, 1);
+                    for (unsigned q = 0; q < bt.reportNum && q < 8; q++) {
+                        int bx = bt.report[q].x, by = bt.report[q].y;
+                        if (bx < 640 || bx > 1280 || by < 200 || by > 690) continue;
+                        double tt = (double)(by - 200) / 490.0;                     /* 0 - верх зоны, 1 - низ */
+                        int np2 = 2 + (int)(tt * 10.0 + 0.5);
+                        if (np2 != A.gl_period) {
+                            A.gl_period = np2;
+                            int tenth = (int)(300.0 / (double)np2 + 0.5);        /* циклов вкл-выкл в секунду, x10 */
+                            snprintf(msg, sizeof(msg), "GLITCH rate %d.%d Hz  (rear panel centre: up = faster)", tenth / 10, tenth % 10);
+                        }
+                        break;
+                    }
+                }
+                if (++A.l_acc >= A.gl_period) { A.l_acc = 0; g_mute = !g_mute; }
             }
         } else if (A.l_glitch) {
             A.l_glitch = 0;
@@ -3304,8 +3494,7 @@ int main(void) {
                     }
                 }
                 if (best >= 0) {
-                    double zr = (double)view_len / (double)length;
-                    double gz = 0.10 + 0.90 * fmin(1.0, sqrt(zr / 0.30));         /* в зуме палец двигает маркер медленнее */
+                    double gz = 1.0;                                              /* маркер идёт точно за пальцем */
                     A.drag_on[best] = 1; A.drag_id[best] = id; A.drag_x0[best] = fx;
                     A.drag_spp[best] = (double)lay_now.vl[bseg] / (double)lay_now.w[bseg] * gz;
                     A.drag_c0[best] = best == 0 ? c1 : (best == 1 ? c2 : 0.0);
@@ -3325,6 +3514,7 @@ int main(void) {
                 if (target > (double)(length - 1)) target = (double)(length - 1);
                 A.scrub_seg = seg;
                 A.scrub_pos = target;
+                A.scrub_head = target;
                 scrub_track_reset(&A.st, fx);
                 A.prev_touch_t = now_t;
                 A.scrub_speed = 0.0;
@@ -3354,7 +3544,7 @@ int main(void) {
                 else if (hit == B_UNDO) act_undo();
                 else if (hit == B_SAVE) { act_save(); last_sys = sceKernelGetSystemTimeWide(); }
                 else if (hit == B_NORM) act_normalize();
-                else if (hit == B_REV) act_reverse();
+                else if (hit == B_REV) act_reverse_toggle();
                 else if (hit == B_SL_PLUS) act_slice_count(1);
                 else if (hit == B_SL_MINUS) act_slice_count(-1);
                 else if (hit >= B_PAD0) act_slice_trigger(hit - B_PAD0);
@@ -3396,8 +3586,13 @@ int main(void) {
                 A.scrub_pos = target;
                 /* скорость определяется расстоянием от пальца до линии воспроизведения:
                  * рядом - ровно 1.0x, дальше - быстрее (до x2), направление - в сторону пальца */
-                double dpx = (target - (double)g_play_pos) / spp_seg;
+                double dtc = tdt < 0.0 ? 0.0 : (tdt > 0.05 ? 0.05 : tdt);
+                double dpx = (target - A.scrub_head) / spp_seg;           /* своя модель линии: позиция из звука приходит ступеньками */
                 double r = scrub_profile(dpx);
+                A.scrub_head += r * (double)SAMPLE_RATE * dtc;
+                A.scrub_head += ((double)g_play_pos - A.scrub_head) * 0.04;
+                if (A.scrub_head < 0.0) A.scrub_head = 0.0;
+                if (A.scrub_head > (double)(length - 1)) A.scrub_head = (double)(length - 1);
                 g_scrub_target = (float)target;
                 g_scrub_vel = (float)(r * (double)SAMPLE_RATE);
                 A.scrub_speed = r * (double)SAMPLE_RATE;
@@ -3426,7 +3621,13 @@ int main(void) {
                 if (f > 1.0f) f = 1.0f;
                 if (fx >= SL_X - 20) fx_set(A.menu_touch_row, (int)(f * (float)(FX[A.menu_touch_row].n - 1) + 0.5f));
             }
-            if (A.btn_down != B_NONE && id == A.btn_id) btn_alive = 1;
+            if (A.btn_down != B_NONE && id == A.btn_id) {
+                btn_alive = 1;
+                if (A.btn_down == B_REV && ++A.rev_hold == 40) {        /* удержание: "запечь" реверс в сам звук */
+                    if (g_rev_req) act_reverse_toggle();                /* снять временный режим */
+                    act_reverse();
+                }
+            }
         }
         if (A.scrubbing && !scrub_alive) {
             A.scrubbing = 0;
@@ -3447,7 +3648,7 @@ int main(void) {
         for (int w = 0; w < 3; w++)
             if (A.drag_on[w] && !drag_alive[w]) { A.drag_on[w] = 0; request_autosave(length, 0); }
         if (A.menu_touch_row >= 0 && !menu_alive) A.menu_touch_row = -1;
-        if (A.btn_down != B_NONE && !btn_alive) { A.btn_down = B_NONE; A.btn_id = -1; }
+        if (A.btn_down != B_NONE && !btn_alive) { A.btn_down = B_NONE; A.btn_id = -1; A.rev_hold = 0; }
         A.prev_n = nrep;
         for (int k = 0; k < nrep; k++) A.prev_ids[k] = touch.report[k].id;
 
@@ -3509,7 +3710,7 @@ int main(void) {
         /* ---- данные для рисования ---- */
         UiState u;
         memset(&u, 0, sizeof(u));
-        u.legend = g_legend; u.mode = g_mode; u.fx_page = A.fx_page; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
+        u.legend = g_legend; u.rev = g_rev_req; u.bpm = g_sl_bpm; u.mode = g_mode; u.fx_page = A.fx_page; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
         u.length = length; u.playhead = playhead; u.live = live;
         u.split = split; u.active = active; u.c1 = c1; u.c2 = c2;
         u.menu_sel = A.menu_sel;
