@@ -243,8 +243,8 @@ static inline int quantize(int v, int bits) {
 #define FADE_SAMPLES   240.0f           /* 5 мс при 48 кГц */
 #define SCRUB_KP       4.0              /* подтяжка позиции к пальцу, 1/с */
 #define SCRUB_GATE     0.006            /* ниже этой скорости (ист./вых. сэмпл) звук затухает */
-static double g_scrub_tau_base = 0.020;    /* базовая инерция скраба, с */
-static double g_scrub_tau_extra = 0.100;   /* добавочная инерция скраба на малой скорости, с */
+static double g_scrub_tau_base = 0.008;    /* базовая инерция скраба, с */
+static double g_scrub_tau_extra = 0.035;   /* добавочная инерция скраба на малой скорости, с */
 static double g_scrub_min_x = 0.20;        /* ниже 20% обычной скорости при скрабе звук глушится */
 
 /* Интерполяция оконным sinc (16 точек, 128 фаз) вместо линейной: чище звук, меньше "цифровых" зеркал */
@@ -421,7 +421,7 @@ static int engine_render(Engine *e, const int16_t *a, int len, const Params *p,
 
     /* сглаживание скраба: на медленном движении сглаживаем сильнее (иначе звук "вибрирует") */
     double rel = fabs(e->scrub_rate) / step;              /* текущая скорость относительно обычной */
-    double slow = 1.0 - rel / 0.7;
+    double slow = 1.0 - rel / 0.5;
     if (slow < 0.0) slow = 0.0;
     if (slow > 1.0) slow = 1.0;
     slow = slow * slow * (3.0 - 2.0 * slow);
@@ -453,6 +453,14 @@ static int engine_render(Engine *e, const int16_t *a, int len, const Params *p,
                            + (p->scrub_target - e->pos) * (SCRUB_KP / (double)OUT_RATE);
             if (desired > maxr) desired = maxr;
             if (desired < -maxr) desired = -maxr;
+            {   /* "магнит" к обычной скорости 1.0x: рука почти не попадает точно, поэтому +-12% прижимаем к 1.0x */
+                double rd = fabs(desired) / step, dd = fabs(rd - 1.0) / 0.12;
+                if (dd < 1.0) {
+                    double w = 1.0 - dd; w = w * w * (3.0 - 2.0 * w);
+                    double tgt = (desired < 0.0 ? -step : step);
+                    desired += (tgt - desired) * w;
+                }
+            }
             e->scrub_rate += (desired - e->scrub_rate) * a_rate;
             s = rd_clamped(a, len, e->pos);
             e->pos += e->scrub_rate;
@@ -1025,9 +1033,9 @@ static void scrub_track_reset(ScrubTrack *s, double x_px) {
 static void scrub_track_step(ScrubTrack *s, double x_px, double dt, double *xf_out, double *vel_px_out) {
     if (dt < 0.004) dt = 0.004;
     if (dt > 0.1) dt = 0.1;
-    double xf = oe_step(&s->oe, x_px, dt, 0.6, 0.03, 1.5);
+    double xf = oe_step(&s->oe, x_px, dt, 1.5, 0.05, 1.5);
     double v = (xf - s->xf_prev) / dt;
-    s->vel_px = 0.7 * s->vel_px + 0.3 * v;
+    s->vel_px = 0.5 * s->vel_px + 0.5 * v;
     s->xf_prev = xf;
     *xf_out = xf;
     *vel_px_out = s->vel_px;
@@ -1184,9 +1192,14 @@ static void slices_pick(int n, const int16_t *a, int rlo, int rhi) {
     int f0 = rlo / ON_HOP + 3, f1 = rhi / ON_HOP - 3;
     if (f0 < 3) f0 = 3;
     if (f1 > nf - 3) f1 = nf - 3;
+    float nmax = 0.0f;
+    for (int f = f0; f < f1; f++) if (g_nov[f] > nmax) nmax = g_nov[f];
+    float thr = 0.06f * nmax; if (thr < 0.10f) thr = 0.10f;
+    int min_sp = SL_MIN_LEN, sp2 = (rhi - rlo) / (3 * n);
+    if (sp2 > min_sp) min_sp = sp2 > 6400 ? 6400 : sp2;
     for (int f = f0; f < f1; f++) {
         float v = g_nov[f];
-        if (v < 0.10f) continue;
+        if (v < thr) continue;
         int is_peak = 1;
         for (int k = -3; k <= 3 && is_peak; k++) if (k && g_nov[f + k] > v) is_peak = 0;
         if (is_peak) { cand[nc].frame = f; cand[nc].s = v; nc++; }
@@ -1198,7 +1211,7 @@ static void slices_pick(int n, const int16_t *a, int rlo, int rhi) {
         int x = refine_onset(a, g_length, cand[c].frame);
         if (x < rlo + SL_MIN_LEN || x > rhi - SL_MIN_LEN) continue;
         int ok = 1;
-        for (int j = 0; j < np; j++) if (abs(x - pos[j]) < SL_MIN_LEN) { ok = 0; break; }
+        for (int j = 0; j < np; j++) if (abs(x - pos[j]) < min_sp) { ok = 0; break; }
         if (ok) pos[np++] = x;
     }
     qsort(pos, (size_t)np, sizeof(int), int_cmp);
@@ -1350,6 +1363,15 @@ static double x_to_sample(const Layout *L, double tx, int *seg_out) {
 }
 
 /* ---------- Волна: рисуем процессором в текстуру (1 draw-вызов) ---------- */
+static inline float wv_at(int length, double p) {
+    if (p < 0.0) p = 0.0;
+    if (p > (double)(length - 1)) p = (double)(length - 1);
+    int i = (int)p;
+    float f = (float)(p - (double)i);
+    int j = i + 1 < length ? i + 1 : i;
+    return (float)g_audio[i] * (1.0f - f) + (float)g_audio[j] * f;
+}
+
 static void render_wave(vita2d_texture *tex, const Layout *L, int length, int live) {
     uint32_t *px = (uint32_t *)vita2d_texture_get_datap(tex);
     int stride = (int)vita2d_texture_get_stride(tex) / 4;
@@ -1393,13 +1415,21 @@ static void render_wave(vita2d_texture *tex, const Layout *L, int length, int li
                     if (g_blk_max[b] > mx) mx = g_blk_max[b];
                 }
             } else {
-                int64_t e = s1;
-                if (e > length - 1) e = length - 1;
-                for (int64_t s = s0; s <= e; s++) {
-                    int v = g_audio[s];
-                    if (v < mn) mn = v;
-                    if (v > mx) mx = v;
+                /* близкий масштаб: непрерывная линия - значения на границах столбца берём интерполяцией,
+                 * поэтому соседние столбцы всегда соединены */
+                double p0 = (double)vs + (double)x * (double)vl / (double)w;
+                double p1 = (double)vs + (double)(x + 1) * (double)vl / (double)w;
+                float v0 = wv_at(length, p0), v1 = wv_at(length, p1);
+                float fmn_ = v0 < v1 ? v0 : v1, fmx_ = v0 < v1 ? v1 : v0;
+                int k0 = (int)ceil(p0), k1 = (int)floor(p1);
+                if (k0 < 0) k0 = 0;
+                if (k1 > length - 1) k1 = length - 1;
+                for (int k = k0; k <= k1; k++) {
+                    float v = (float)g_audio[k];
+                    if (v < fmn_) fmn_ = v;
+                    if (v > fmx_) fmx_ = v;
                 }
+                mn = (int)floorf(fmn_); mx = (int)ceilf(fmx_);
             }
             if (mx < mn) continue;
 
@@ -1407,10 +1437,30 @@ static void render_wave(vita2d_texture *tex, const Layout *L, int length, int li
             float fmn = (float)mn * gain / 32768.0f; if (fmn < -1.0f) fmn = -1.0f;
             int ytop = cy - (int)(fmx * half);
             int ybot = cy - (int)(fmn * half);
+            if (!use_blocks && ybot - ytop < 2) { int m = (ytop + ybot) / 2; ytop = m - 1; ybot = m + 1; }
             if (ybot - ytop < 1) { ytop = cy - 1; ybot = cy + 1; }
             if (ytop < 0) ytop = 0;
             if (ybot > WAVE_H - 1) ybot = WAVE_H - 1;
             for (int y = ytop; y <= ybot; y++) px[y * stride + x0 + x] = col;
+        }
+
+        /* очень близко: отдельные сэмплы видны точками */
+        if ((double)vl / (double)w < 0.25) {
+            int k0 = (int)ceil((double)vs), k1 = (int)floor((double)vs + (double)vl);
+            if (k0 < 0) k0 = 0;
+            if (k1 > length - 1) k1 = length - 1;
+            for (int k = k0; k <= k1; k++) {
+                int xx = (int)(((double)k - (double)vs) * (double)w / (double)vl);
+                float fv = (float)g_audio[k] * gain / 32768.0f;
+                if (fv > 1.0f) fv = 1.0f;
+                if (fv < -1.0f) fv = -1.0f;
+                int yy = cy - (int)(fv * half);
+                for (int dy = -2; dy <= 2; dy++)
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int X = xx + dx, Y = yy + dy;
+                        if (X >= 0 && X < w && Y >= 0 && Y < WAVE_H) px[Y * stride + x0 + X] = RGBA8(255, 236, 190, 255);
+                    }
+            }
         }
     }
 }
@@ -1696,10 +1746,8 @@ static int btn_geom(int id, int mode, int fx_page, int sl_n, int *x, int *y, int
     switch (id) {
     case B_SL_MINUS: *x = 776; *y = 362; *w = 70; *h = 32; return 1;
     case B_SL_PLUS:  *x = 854; *y = 362; *w = 70; *h = 32; return 1;
-    case B_ZOUT:     *x = 776; *y = 400; *w = 70; *h = 32; return 1;
-    case B_ZIN:      *x = 854; *y = 400; *w = 70; *h = 32; return 1;
-    case B_LOOP:     *x = 776; *y = 438; *w = 70; *h = 40; return 1;
-    case B_FX:       *x = 854; *y = 438; *w = 70; *h = 40; return 1;
+    case B_LOOP:     *x = 776; *y = 410; *w = 70; *h = 68; return 1;
+    case B_FX:       *x = 854; *y = 410; *w = 70; *h = 68; return 1;
     }
     return 0;
 }
@@ -1707,10 +1755,10 @@ static int btn_geom(int id, int mode, int fx_page, int sl_n, int *x, int *y, int
 static int hit_test(int tx, int ty, int mode, int fx_page, int sl_n) {
     static const int order_edit[] = { B_TAB_EDIT, B_TAB_SLICE, B_REC, B_PLAY, B_STOP, B_LOOP, B_FX,
                                       B_CROP, B_UNDO, B_SAVE, B_ZOUT, B_ZIN };
-    static const int order_slice[] = { B_TAB_EDIT, B_TAB_SLICE, B_SL_MINUS, B_SL_PLUS, B_ZOUT, B_ZIN, B_LOOP, B_FX };
+    static const int order_slice[] = { B_TAB_EDIT, B_TAB_SLICE, B_SL_MINUS, B_SL_PLUS, B_LOOP, B_FX };
     static const int order_fx[] = { B_TAB_EDIT, B_TAB_SLICE, B_FX_CLOSE };
     const int *ord = fx_page ? order_fx : (mode == 0 ? order_edit : order_slice);
-    int n = fx_page ? 3 : (mode == 0 ? 12 : 8);
+    int n = fx_page ? 3 : (mode == 0 ? 12 : 6);
     for (int i = 0; i < n; i++) {
         int x, y, w, h;
         if (btn_geom(ord[i], mode, fx_page, sl_n, &x, &y, &w, &h) && tx >= x && tx < x + w && ty >= y && ty < y + h)
@@ -1739,7 +1787,7 @@ typedef struct {
     char msg[160];
     int sl_n, sl_sel, sl_flash, sl_playing;
     int btn_down, can_undo;
-    int crop_armed;
+    int crop_armed, legend;
     double scrub_pos, scrub_speed;
     unsigned frame;
     Layout lay;
@@ -1923,8 +1971,8 @@ static void draw_pad(Canvas *c, const UiState *u, int i, int cy0) {
               playing ? RGBA8(200, 255, 200, 255) : (sel ? K_YELLOW : RGBA8(150, 134, 108, 255)));
 }
 
-static const int g_side_ids[6] = { B_SL_MINUS, B_SL_PLUS, B_ZOUT, B_ZIN, B_LOOP, B_FX };
-static const int g_side_ics[6] = { IC_MINUS, IC_PLUS, IC_ZOUT, IC_ZIN, IC_LOOP, IC_FX };
+static const int g_side_ids[4] = { B_SL_MINUS, B_SL_PLUS, B_LOOP, B_FX };
+static const int g_side_ics[4] = { IC_MINUS, IC_PLUS, IC_LOOP, IC_FX };
 
 static int side_style(const UiState *u, int k) {
     if (g_side_ids[k] == B_LOOP && u->loop) return 1;
@@ -1998,7 +2046,7 @@ static int ctl_update(Canvas *c, const UiState *u) {
                 changed = 1;
             }
         }
-        for (int k = 0; k < 6; k++) {
+        for (int k = 0; k < 4; k++) {
             int code = 1 + side_style(u, k) + 4 * (u->btn_down == g_side_ids[k]);
             if (code != g_wcode[W_SIDE0 + k]) {
                 int x, y, w, h;
@@ -2172,7 +2220,7 @@ static void draw_ticks(const UiState *u) {
     }
 }
 
-static const char *legend1 = "R rec/stop   L play/pause   TRIANGLE stop (hold = keep pos)   SQUARE loop   CIRCLE effects   SELECT save   START exit";
+static int g_legend = 0;
 
 static void ui_draw(const UiState *u) {
     char buf[200], t1[32];
@@ -2182,7 +2230,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя панель: название и вкладки */
     text(62, 30, K_BROWN, 1.25f, "VITA SAMPLER");
-    text(62, 44, K_BROWN_LO, 0.62f, "SAMPLER / LOOPER   v0.8");
+    text(62, 44, K_BROWN_LO, 0.62f, "SAMPLER / LOOPER   v0.9");
     text_c(384 + 46, 31, u->mode == 0 ? K_CREAM_HI : K_BROWN, 0.95f, "EDIT");
     text_c(484 + 46, 31, u->mode == 1 ? K_CREAM_HI : K_BROWN, 0.95f, "SLICE");
     text(622, 31, u->loop ? RGBA8(160, 240, 170, 255) : K_BROWN_LO, 0.9f, "LOOP");
@@ -2278,14 +2326,26 @@ static void ui_draw(const UiState *u) {
         text(776, 354, K_BROWN, 1.0f, buf);
     }
 
-    /* легенда */
-    text(32, 514, K_BROWN, 0.78f, legend1);
-    if (u->fx_page)
-        text(32, 531, K_ORANGE_LO, 0.78f, "MENU: D-pad up/down row   left/right value   left stick value   touch sliders   X reset (hold = all)   O close");
-    else if (u->mode == 0)
-        text(32, 531, K_BROWN_LO, 0.78f, "sticks: cursors A/B (both up/down = zoom)   D-pad: cursor / zoom   X hold: crop   L hold: glitch   touch wave: scrub");
-    else
-        text(32, 531, K_BROWN_LO, 0.78f, "slices are made inside A-B   sticks: move slice start/end   D-pad: pick / count   X: play   L hold: glitch   touch pads");
+    /* подсказка и окно справки */
+    text(32, 520, K_BROWN_LO, 0.78f, "SELECT help     START save WAV     SELECT+START hold = exit");
+    if (u->legend) {
+        rect(24, 58, 912, 254, RGBA8(22, 18, 14, 238));
+        rect_outline(24, 58, 912, 254, 2, K_ORANGE_LO);
+        static const char *L[] = {
+            "CONTROLS                                                              (SELECT closes)",
+            "R  record / stop       L  play / pause  (hold L = glitch, right stick up/down = rate)",
+            "TRIANGLE  stop (hold = keep position)      SQUARE  loop      CIRCLE  effects",
+            "START  save WAV      SELECT  this help      SELECT + START (hold)  exit",
+            "EDIT   sticks move cursors A / B      both sticks up / down = zoom in / out",
+            "       D-pad left/right = active cursor      D-pad up/down = zoom      X hold = crop to A-B",
+            "       touch the top of the wave next to A or B and drag = move the cursor",
+            "       touch the wave elsewhere = scrub (max x2, quieter below 20%)",
+            "SLICE  regions are built inside A-B chosen in EDIT      X  play slice",
+            "       sticks nudge slice start / end      D-pad left/right = pick slice, up/down = count",
+            "MENU   D-pad up/down row, left/right value, left stick, touch sliders, X reset (hold = all)"
+        };
+        for (int i = 0; i < 11; i++) text(40, 82 + i * 21, i == 0 ? K_YELLOW : K_AMBER_LT, 0.82f, L[i]);
+    }
 }
 
 /* ---------- Ввод: стики и ползунки ---------- */
@@ -2373,6 +2433,7 @@ typedef struct {
     int nudge_frames, zoom_frames, nav_frames, cnt_frames;
     double zoom_rem, zoom_anchor;
     int l_frames, l_pre, l_glitch, l_acc;
+    int drag_on, drag_id, drag_which;
 } App;
 static App A;
 
@@ -2693,7 +2754,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v0.8");
+    dbg_log("start v0.9");
 
     g_audio = (int16_t *)malloc(MAX_SAMPLES * sizeof(int16_t));
     if (!g_audio) { dbg_log("malloc failed"); sceKernelExitProcess(0); }
@@ -2826,8 +2887,20 @@ int main(void) {
 
         sceCtrlPeekBufferPositive(0, &pad, 1);
         unsigned int pressed = pad.buttons & ~old_buttons;
+        unsigned int released = old_buttons & ~pad.buttons;
         old_buttons = pad.buttons;
-        if (pressed & SCE_CTRL_START) break;
+        {   /* START - сохранить, SELECT - справка (по отпусканию короткого нажатия); обе вместе 0.75 с - выход */
+            static int sel_f = 0, st_f = 0, exit_f = 0, combo = 0;
+            int both = (pad.buttons & SCE_CTRL_SELECT) && (pad.buttons & SCE_CTRL_START);
+            if (both) { combo = 1; if (++exit_f >= 45) break; } else exit_f = 0;
+            if (pad.buttons & SCE_CTRL_SELECT) sel_f++;
+            if (pad.buttons & SCE_CTRL_START) st_f++;
+            if ((released & SCE_CTRL_SELECT) && !combo && sel_f < 30) g_legend = !g_legend;
+            if ((released & SCE_CTRL_START) && !combo && st_f < 30) { act_save(); last_sys = sceKernelGetSystemTimeWide(); }
+            if (!(pad.buttons & SCE_CTRL_SELECT)) sel_f = 0;
+            if (!(pad.buttons & SCE_CTRL_START)) st_f = 0;
+            if (!(pad.buttons & (SCE_CTRL_SELECT | SCE_CTRL_START))) combo = 0;
+        }
 
         int state = g_state;
         int length = g_length;
@@ -2880,7 +2953,6 @@ int main(void) {
             A.l_frames = 0;
         } else A.l_frames = 0;
         if (pressed & SCE_CTRL_SQUARE)   act_loop_toggle();
-        if (pressed & SCE_CTRL_SELECT) { act_save(); last_sys = sceKernelGetSystemTimeWide(); }
         if (pressed & SCE_CTRL_CIRCLE)   act_fx_toggle();
 
         /* Треугольник: стоп; удержание - позиция сохраняется */
@@ -3079,7 +3151,23 @@ int main(void) {
             double fx = touch.report[k].x / 2.0, fy = touch.report[k].y / 2.0;
             int in_wave = (fx >= WAVE_X - 4 && fx <= WAVE_X + WAVE_W + 4 && fy >= WAVE_Y - 18 && fy <= WAVE_Y + WAVE_H + 18);
 
-            if (in_wave && !A.scrubbing && g_state != ST_RECORDING && length > 1) {
+            if (in_wave && g_mode == 0 && !A.fx_page && !A.drag_on && !A.scrubbing && g_state != ST_RECORDING
+                && length > 1 && fy < WAVE_Y + 46) {
+                int best = -1; double bd = 28.0;
+                for (int w = 0; w < 2; w++)
+                    for (int sg = 0; sg < lay_now.nseg; sg++) {
+                        int mxp = sample_to_x(&lay_now, sg, w ? c2 : c1);
+                        if (mxp == -1000000) continue;
+                        double d = fabs(fx - (double)mxp);
+                        if (d < bd) { bd = d; best = w; }
+                    }
+                if (best >= 0) {
+                    A.drag_on = 1; A.drag_id = id; A.drag_which = best; active = best;
+                    snprintf(msg, sizeof(msg), "Dragging cursor %c", best ? 'B' : 'A');
+                    continue;
+                }
+            }
+            if (in_wave && !A.scrubbing && !A.drag_on && g_state != ST_RECORDING && length > 1) {
                 int seg = 0;
                 A.scrubbing = 1;
                 A.scrub_id = id;
@@ -3136,7 +3224,7 @@ int main(void) {
         }
 
         /* уже идущие касания */
-        int scrub_alive = 0, menu_alive = 0, btn_alive = 0;
+        int scrub_alive = 0, menu_alive = 0, btn_alive = 0, drag_alive = 0;
         for (int k = 0; k < nrep; k++) {
             int id = touch.report[k].id;
             double fx = touch.report[k].x / 2.0;
@@ -3161,6 +3249,15 @@ int main(void) {
                 A.scrub_speed = vp * spp_seg;
                 g_scrub_target = (float)target;
                 g_scrub_vel = (float)(vp * spp_seg);
+            }
+            if (A.drag_on && id == A.drag_id) {
+                drag_alive = 1;
+                int sg2 = 0;
+                double tg = x_to_sample(&lay_now, fx, &sg2);
+                if (A.drag_which == 0) c1 = tg; else c2 = tg;
+                active = A.drag_which;
+                enforce_cursors(length);
+                g_lo = (int)c1; g_hi = (int)c2;
             }
             if (A.menu_touch_row >= 0 && id == A.menu_touch_id) {
                 menu_alive = 1;
@@ -3187,12 +3284,13 @@ int main(void) {
             }
             dbg_log("scrub end %d", endpos);
         }
+        if (A.drag_on && !drag_alive) { A.drag_on = 0; request_autosave(length, 0); }
         if (A.menu_touch_row >= 0 && !menu_alive) A.menu_touch_row = -1;
         if (A.btn_down != B_NONE && !btn_alive) { A.btn_down = B_NONE; A.btn_id = -1; }
         A.prev_n = nrep;
         for (int k = 0; k < nrep; k++) A.prev_ids[k] = touch.report[k].id;
 
-        if ((pressed & ~(SCE_CTRL_RTRIGGER | SCE_CTRL_CROSS)) && A.confirm && !(pressed & SCE_CTRL_SELECT)) A.confirm = 0;
+        if ((pressed & ~(SCE_CTRL_RTRIGGER | SCE_CTRL_CROSS)) && A.confirm) A.confirm = 0;
 
         /* ---- подготовка к рисованию ---- */
         state = g_state;
@@ -3250,7 +3348,7 @@ int main(void) {
         /* ---- данные для рисования ---- */
         UiState u;
         memset(&u, 0, sizeof(u));
-        u.mode = g_mode; u.fx_page = A.fx_page; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
+        u.legend = g_legend; u.mode = g_mode; u.fx_page = A.fx_page; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
         u.length = length; u.playhead = playhead; u.live = live;
         u.split = split; u.active = active; u.c1 = c1; u.c2 = c2;
         u.menu_sel = A.menu_sel;
