@@ -37,6 +37,7 @@ target_link_libraries(${PROJECT_NAME}
   png
   jpeg
   z
+  bz2
   m
   c
 )
