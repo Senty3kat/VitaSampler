@@ -74,6 +74,9 @@ unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 #define METER_H 228
 #define METER_TICKS 8           /* от 0 до -24 дБ, засечка каждые 3 дБ */
 #define METER_DB 24
+#define GL_M 7                    /* поле вокруг экрана в текстуре стекла (литая кромка) */
+#define GL_W (CRT_W + 2 * GL_M)
+#define GL_H (CRT_H + 2 * GL_M)
 #define PN_X 10
 #define PN_Y 362
 #define PN_W 938
@@ -2562,22 +2565,64 @@ static void skin_render_static(Canvas *c) {
     }
 }
 
-/* стекло перед ЭЛТ: строки развёртки, затемнение к краям, оранжевый оттенок, блик */
+/* знаковое расстояние до скруглённого прямоугольника (внутри < 0) */
+static float sd_rrect(float px, float py, float x0, float y0, float w, float h, float r) {
+    float qx = fabsf(px - (x0 + w * 0.5f)) - (w * 0.5f - r), qy = fabsf(py - (y0 + h * 0.5f)) - (h * 0.5f - r);
+    float ax = qx > 0.0f ? qx : 0.0f, ay = qy > 0.0f ? qy : 0.0f;
+    float m = qx > qy ? qx : qy;
+    return sqrtf(ax * ax + ay * ay) + (m < 0.0f ? m : 0.0f) - r;
+}
+
+/* выпуклое стекло ЭЛТ (холст GL_W x GL_H: экран + поле GL_M для литой кромки): светится центр, края темнее,
+ * кромка стекла со скосом, тень от оправы сверху-слева, отражение софтбокса и дуга бликов вдоль края, строки развёртки */
 static void glass_render(Canvas *c) {
+    const float CR = 9.0f;
     for (int y = 0; y < c->h; y++)
         for (int x = 0; x < c->w; x++) {
-            float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
-            float rx = fabsf(fx - c->w * 0.5f) - (c->w * 0.5f - 9.0f), ry = fabsf(fy - c->h * 0.5f) - (c->h * 0.5f - 9.0f);
-            if (rx > 0.0f && ry > 0.0f && sqrtf(rx * rx + ry * ry) > 9.0f) { c->px[y * c->w + x] = 0; continue; }
-            uint32_t *d = &c->px[y * c->w + x];
-            *d = 0;
-            cv_put(c, x, y, RGBA8(255, 120, 20, 16), 1.0f);                       /* оранжевое стекло */
-            float u = (fx + 0.45f * fy) / (float)c->w;                             /* блик */
-            if (u > 0.10f && u < 0.52f) { float t = sinf((u - 0.10f) / 0.42f * 3.14159265f); cv_put(c, x, y, RGBA8(255, 226, 180, 26), t); }
-            float dx = (fx - c->w * 0.5f) / (c->w * 0.5f), dy = (fy - c->h * 0.5f) / (c->h * 0.5f);
-            float v = (dx * dx * 0.7f + dy * dy * 0.9f - 0.35f) / 0.9f;           /* виньетка */
-            if (v > 0.0f) cv_put(c, x, y, RGBA8(8, 3, 0, 255), fclampf(v, 0.0f, 1.0f) * 0.4f);
-            if (y % 3 == 1) cv_put(c, x, y, RGBA8(0, 0, 0, 255), 0.17f);           /* строки развёртки */
+            float fx = (float)x + 0.5f - GL_M, fy = (float)y + 0.5f - GL_M;           /* координаты относительно экрана */
+            float d = sd_rrect(fx, fy, 0.0f, 0.0f, (float)CRT_W, (float)CRT_H, CR);
+            uint32_t *dp = &c->px[y * c->w + x];
+            *dp = 0;
+            /* нормаль к краю (наружу) */
+            float qx = fabsf(fx - CRT_W * 0.5f) - (CRT_W * 0.5f - CR), qy = fabsf(fy - CRT_H * 0.5f) - (CRT_H * 0.5f - CR);
+            float nx = qx > 0.0f ? qx : 0.0f, ny = qy > 0.0f ? qy : 0.0f;
+            if (nx == 0.0f && ny == 0.0f) { if (qx > qy) nx = 1.0f; else ny = 1.0f; }
+            float nl = sqrtf(nx * nx + ny * ny);
+            nx = (fx < CRT_W * 0.5f ? -nx : nx) / nl; ny = (fy < CRT_H * 0.5f ? -ny : ny) / nl;
+            float lit = nx * -0.62f + ny * -0.78f;                                     /* >0: край обращён к свету (сверху-слева) */
+            if (d > 0.0f) {
+                if (d > (float)GL_M) continue;
+                float t = d / (float)GL_M;                                            /* литая кромка снаружи: скос */
+                float pr = sinf(t * 3.14159265f);
+                if (lit > 0.0f) cv_put(c, x, y, RGBA8(255, 214, 160, 255), 0.62f * lit * pr);
+                else cv_put(c, x, y, RGBA8(70, 24, 4, 255), 0.55f * -lit * pr);
+                if (d < 1.4f) cv_put(c, x, y, RGBA8(40, 12, 2, 255), 0.7f * (1.0f - d / 1.4f));
+                continue;
+            }
+            float in = -d;
+            cv_put(c, x, y, RGBA8(255, 120, 20, 255), 0.06f);                       /* оранжевое стекло */
+            float ex = (fx / (CRT_W * 0.5f) - 1.0f), ey = (fy / (CRT_H * 0.5f) - 1.0f);
+            float rr = powf(powf(fabsf(ex), 2.6f) + powf(fabsf(ey), 2.6f), 1.0f / 2.6f);   /* суперэллипс: 0 в центре, 1 у края */
+            float glow = 1.0f - rr * rr;
+            if (glow > 0.0f) cv_put(c, x, y, RGBA8(255, 150, 50, 255), 0.05f * glow);   /* свечение люминофора в центре */
+            float vg = rr > 0.55f ? (rr - 0.55f) / 0.45f : 0.0f;                    /* выпуклость: края темнеют */
+            if (vg > 0.0f) cv_put(c, x, y, RGBA8(6, 2, 0, 255), fclampf(vg, 0.0f, 1.0f) * 0.6f);
+            if (lit > 0.0f && in < 14.0f) cv_put(c, x, y, RGBA8(0, 0, 0, 255), 0.5f * lit * expf(-in / 5.0f));    /* тень от оправы */
+            if (lit < 0.0f && in < 10.0f) cv_put(c, x, y, RGBA8(255, 190, 120, 255), 0.22f * -lit * expf(-in / 3.0f));   /* отсвет на нижнем крае */
+            /* дуга блика вдоль верхнего левого края (отражение оправы в стекле) */
+            if (lit > 0.35f && in > 4.0f && in < 8.0f) {
+                float k = (in - 4.0f) / 4.0f; k = 1.0f - fabsf(k * 2.0f - 1.0f);
+                float fade = fclampf((lit - 0.35f) / 0.65f, 0.0f, 1.0f);
+                float along = (fx + fy * 0.4f) / (float)CRT_W;
+                float f2 = along < 0.55f ? 1.0f - along / 0.55f : 0.0f;
+                cv_put(c, x, y, RGBA8(255, 230, 190, 255), 0.30f * k * fade * f2);
+            }
+            {                                                                       /* слабые вторичные отражения у краёв: не мешают тексту */
+                float rx = (fx - 0.90f * CRT_W) / (0.10f * CRT_W), ry = (fy - 0.80f * CRT_H) / (0.18f * CRT_H);
+                float re = 1.0f - (rx * rx + ry * ry);
+                if (re > 0.0f) cv_put(c, x, y, RGBA8(255, 200, 140, 255), 0.06f * re);
+            }
+            if (y % 3 == 1) cv_put(c, x, y, RGBA8(0, 0, 0, 255), 0.15f * (1.0f - 0.5f * glow));   /* строки развёртки: к краям заметнее */
         }
 }
 
@@ -2728,9 +2773,9 @@ static int ctl_update(Canvas *c, const UiState *u) {
                 int x, y, w, h;
                 btn_geom(id, &x, &y, &w, &h);
                 cv_clear_part(c, x, y - CTL_TY, w, h);
-                int pr = (u->btn_down == id);
-                cv_key(c, x, y - CTL_TY, w, h, st, pr);
-                cv_icon_ex(c, icons[id - B_CROP], (float)(x + w / 2), (float)(y - CTL_TY + 33 + (pr ? 2 : 0)), st ? K_CREAM_HI : (dim ? K_BROWN_LO : K_BROWN));
+                int pr = (u->btn_down == id) || st;           /* включённая функция залипает в нажатом положении */
+                cv_key(c, x, y - CTL_TY, w, h, 0, pr);
+                cv_icon_ex(c, icons[id - B_CROP], (float)(x + w / 2), (float)(y - CTL_TY + 33 + (pr ? 2 : 0)), dim ? K_BROWN_LO : K_BROWN);
                 g_wcode[W_EDIT0 + id - B_CROP] = code;
                 changed = 1;
             }
@@ -2743,7 +2788,7 @@ static int ctl_update(Canvas *c, const UiState *u) {
                 int x, y, w, h;
                 pad_geom(i, u->sl_n, &x, &y, &w, &h);
                 cv_clear_part(c, x, y - CTL_TY, w, h);
-                cv_key(c, x, y - CTL_TY, w, h, playing ? 3 : (sel ? 1 : 0), (u->btn_down == B_PAD0 + i) || (sel && u->sl_flash > 0));
+                cv_key(c, x, y - CTL_TY, w, h, 0, (u->btn_down == B_PAD0 + i) || sel || playing);   /* выбранный пад залипает */
                 g_wcode[W_PAD0 + i] = code;
                 changed = 1;
             }
@@ -2780,9 +2825,9 @@ static int ctl_update(Canvas *c, const UiState *u) {
             int x, y, w, h;
             btn_geom(B_GR_ON, &x, &y, &w, &h);
             cv_clear_part(c, x, y - CTL_TY, w, h);
-            int pr = (u->btn_down == B_GR_ON);
-            cv_key(c, x, y - CTL_TY, w, h, u->gr_on ? 1 : 0, pr);
-            cv_icon_ex(c, IC_GRAIN, (float)(x + w / 2), (float)(y - CTL_TY + 32 + (pr ? 2 : 0)), u->gr_on ? K_CREAM_HI : K_BROWN);
+            int pr = (u->btn_down == B_GR_ON) || u->gr_on;
+            cv_key(c, x, y - CTL_TY, w, h, 0, pr);
+            cv_icon_ex(c, IC_GRAIN, (float)(x + w / 2), (float)(y - CTL_TY + 32 + (pr ? 2 : 0)), K_BROWN);
             g_wcode[W_GRON] = code;
             changed = 1;
         }
@@ -2810,7 +2855,7 @@ static int ctl_update(Canvas *c, const UiState *u) {
                 btn_geom(B_FT0 + i, &x, &y, &w, &h);
                 cv_clear_part(c, x, y - CTL_TY, w, h);
                 int pr = sel || (u->btn_down == B_FT0 + i);
-                cv_key(c, x, y - CTL_TY, w, h, sel ? 1 : 4, pr);
+                cv_key(c, x, y - CTL_TY, w, h, 0, pr);
                 static const float sh[4][4][2] = {
                     { { -12, 0 }, { 12, 0 }, { 12, 0 }, { 12, 0 } },
                     { { -12, 0 }, { 0, 0 }, { 12, 9 }, { 12, 9 } },
@@ -2818,7 +2863,7 @@ static int ctl_update(Canvas *c, const UiState *u) {
                     { { -12, 9 }, { -4, 0 }, { 4, 0 }, { 12, 9 } } };
                 float cx0 = (float)(x + w / 2), cy0 = (float)(y - CTL_TY + 16 + (pr ? 2 : 0));
                 for (int q = 0; q < 3; q++)
-                    cv_line(c, cx0 + sh[i][q][0], cy0 + sh[i][q][1], cx0 + sh[i][q + 1][0], cy0 + sh[i][q + 1][1], 1.3f, sel ? K_CREAM_HI : K_BROWN);
+                    cv_line(c, cx0 + sh[i][q][0], cy0 + sh[i][q][1], cx0 + sh[i][q + 1][0], cy0 + sh[i][q + 1][1], 1.3f, K_BROWN);
                 g_wcode[W_FT0 + i] = code;
                 changed = 1;
             }
@@ -2855,7 +2900,7 @@ static void upload_canvas(vita2d_texture *tex, const Canvas *c) {
 
 static void ui_create_textures(void) {
     g_tex_bg = vita2d_create_empty_texture(SCR_W, SCR_H);
-    g_tex_glass = vita2d_create_empty_texture(CRT_W, CRT_H);
+    g_tex_glass = vita2d_create_empty_texture(GL_W, GL_H);
     g_tex_meter = vita2d_create_empty_texture(METER_W, METER_H);
     upload_canvas(g_tex_meter, &g_cv_meter);
     g_tex_mglass = vita2d_create_empty_texture(METER_W + 8, METER_H + 8);
@@ -2874,7 +2919,7 @@ static int ui_init(void) {
     assets_init();
     g_cv_bg.w = SCR_W; g_cv_bg.h = SCR_H; g_cv_bg.px = (uint32_t *)malloc((size_t)SCR_W * SCR_H * 4);
     g_cv_top.w = SCR_W; g_cv_top.h = TOP_H; g_cv_top.px = (uint32_t *)malloc((size_t)SCR_W * TOP_H * 4);
-    g_cv_glass.w = CRT_W; g_cv_glass.h = CRT_H; g_cv_glass.px = (uint32_t *)calloc((size_t)CRT_W * CRT_H, 4);
+    g_cv_glass.w = GL_W; g_cv_glass.h = GL_H; g_cv_glass.px = (uint32_t *)calloc((size_t)GL_W * GL_H, 4);
     for (int i = 0; i < 5; i++) {
         g_cv_page[i].w = SCR_W; g_cv_page[i].h = CTL_TH;
         g_cv_page[i].px = (uint32_t *)calloc((size_t)SCR_W * CTL_TH, 4);
@@ -3205,7 +3250,7 @@ static void ui_draw(const UiState *u) {
     }
 
     /* стекло перед ЭЛТ */
-    if (g_tex_glass) vita2d_draw_texture(g_tex_glass, CRT_X, CRT_Y);
+    if (g_tex_glass) vita2d_draw_texture(g_tex_glass, CRT_X - GL_M, CRT_Y - GL_M);
 
     /* индикатор уровня: сплошной градиент в стеклянной трубке, пик, засечки, окна */
     {
@@ -3254,8 +3299,8 @@ static void ui_draw(const UiState *u) {
         for (int id = B_CROP; id <= B_NORM; id++) {
             int x, y, w, h;
             btn_geom(id, &x, &y, &w, &h);
-            int st = edit_style(u, id), pr = (u->btn_down == id);
-            text_c(x + w / 2, y + h - 18 + (pr ? 2 : 0), st ? K_CREAM_HI : ((id == B_UNDO && !u->can_undo) ? K_BROWN_LO : K_BROWN), 0.68f, names[id - B_CROP]);
+            int st = edit_style(u, id), pr = (u->btn_down == id) || st;
+            text_c(x + w / 2, y + h - 18 + (pr ? 2 : 0), (id == B_UNDO && !u->can_undo) ? K_BROWN_LO : K_BROWN, 0.68f, names[id - B_CROP]);
         }
         text(332, 500, K_BROWN, 0.58f, "SELECT help     START save WAV     TRIANGLE x2 reset A-B");
         text(332, 514, K_BROWN, 0.58f, "hold L = glitch (rear panel: up / down = rate)     drag a knob: up / down");
@@ -3276,13 +3321,13 @@ static void ui_draw(const UiState *u) {
             snprintf(nb, sizeof(nb), "%d", i + 1);
             int on = (i == u->sl_sel) || (i == u->sl_playing);
             float sc = h < 40 ? 0.62f : (h < 60 ? 0.85f : 1.2f);
-            text_c(x + w / 2, y + h / 2 + (int)(6 * sc) + ((u->btn_down == B_PAD0 + i) ? 2 : 0), on ? K_CREAM_HI : K_BROWN, sc, nb);
+            text_c(x + w / 2, y + h / 2 + (int)(6 * sc) + (((u->btn_down == B_PAD0 + i) || on) ? 2 : 0), K_BROWN, sc, nb);
         }
         text(796, 390, K_BROWN, 0.66f, "SLICES");
         text(796, 466, u->bpm_t != u->bpm_b ? K_ORANGE_LO : K_BROWN, 0.66f, "BPM");
         if (u->bpm > 0) { snprintf(buf, sizeof(buf), "orig %d", u->bpm_b); text(850, 466, K_BROWN_LO, 0.55f, buf); }
     } else if (u->page == 2) {
-        text_c(885, 461 + ((u->btn_down == B_GR_ON) ? 2 : 0), u->gr_on ? K_CREAM_HI : K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
+        text_c(885, 461 + (((u->btn_down == B_GR_ON) || u->gr_on) ? 2 : 0), K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
         text_c(885, 504, K_BROWN, 0.55f, "same pitch and speed,");
         text_c(885, 517, K_BROWN, 0.55f, "fade in / fade out");
     } else {
@@ -3299,7 +3344,7 @@ static void ui_draw(const UiState *u) {
                 int x, y, w, h;
                 btn_geom(B_FT0 + i, &x, &y, &w, &h);
                 int sel = (u->flt_type == i);
-                text_c(x + w / 2, y + h - 15 + (sel ? 2 : 0), sel ? K_CREAM_HI : K_BROWN, 0.62f, ft[i]);
+                text_c(x + w / 2, y + h - 15 + (((u->btn_down == B_FT0 + i) || sel) ? 2 : 0), K_BROWN, 0.62f, ft[i]);
             }
             static const char *fl[3] = { "100 Hz", "1 kHz", "4 kHz" };
             static const float ff[3] = { 100.0f, 1000.0f, 4000.0f };
@@ -3408,6 +3453,8 @@ typedef struct {
     int l_frames, l_pre, l_glitch, l_acc;
     int drag_on[3], drag_id[3];                  /* 0 = маркер A, 1 = маркер B, 2 = вся область */
     double drag_x0[3], drag_spp[3], drag_c0[3], drag_c1_0, drag_c2_0;
+    int pz_on, pz_id[2];                         /* зум двумя пальцами по волне */
+    double pz_d0, pz_len0, pz_cs;
 } App;
 static App A;
 
@@ -3569,7 +3616,7 @@ static void act_loop_toggle(void) {
 
 /* страницы: 0 EDIT, 1 SLICE, 2 GRAIN, 3 FX, 4 ADV (EDIT / SLICE - режимы, ADV работает в EDIT, GRAIN и FX - над текущим режимом) */
 static void act_tab(int t) {
-    if (t == 0 || t == 4) { act_set_mode(0); if (g_mode == 0) A.page = t; }
+    if (t == 0 || t == 2 || t == 4) { act_set_mode(0); if (g_mode == 0) A.page = t; }   /* GRAIN работает по области A-B (вся дорожка или выбранная), слайсы не мешают */
     else if (t == 1) { act_set_mode(1); if (g_mode == 1) A.page = 1; }
     else A.page = t;
     A.knob_on = 0; A.curve_on = 0;
@@ -4301,7 +4348,7 @@ int main(void) {
         }
 
         /* ---- положение окна: сплит (только EDIT и только если вся запись не видна) ---- */
-        if (state != ST_RECORDING && length > 1) {
+        if (state != ST_RECORDING && length > 1 && !A.pz_on) {
             clamp_view(length);
             if (g_mode == 1 || view_len >= length) {
                 split = 0;
@@ -4465,6 +4512,52 @@ int main(void) {
                 A.btn_hold = 0;
                 perform_hit(hit);
                 continue;
+            }
+        }
+
+        /* ---- зум двумя пальцами по волне (EDIT): расстояние между пальцами = масштаб, середина удерживает точку волны ---- */
+        {
+            int wi[6], wn = 0;
+            for (int k = 0; k < nrep && wn < 6; k++) {
+                double tx = touch.report[k].x / 2.0, ty = touch.report[k].y / 2.0;
+                if (tx >= WAVE_X - 10 && tx <= WAVE_X + WAVE_W + 10 && ty >= WAVE_Y - 18 && ty <= WAVE_Y + WAVE_H + 24) wi[wn++] = k;
+            }
+            if (A.pz_on) {
+                int k0 = -1, k1 = -1;
+                for (int k = 0; k < nrep; k++) {
+                    if (touch.report[k].id == A.pz_id[0]) k0 = k;
+                    if (touch.report[k].id == A.pz_id[1]) k1 = k;
+                }
+                if (k0 < 0 || k1 < 0 || g_mode != 0 || g_state == ST_RECORDING) A.pz_on = 0;
+                else {
+                    double x0 = touch.report[k0].x / 2.0, x1 = touch.report[k1].x / 2.0;
+                    double d = fabs(x1 - x0);
+                    if (d < 12.0) d = 12.0;
+                    double nl = A.pz_len0 * A.pz_d0 / d;
+                    if (nl < (double)MIN_VIEW) nl = (double)MIN_VIEW;
+                    if (nl > (double)length) nl = (double)length;
+                    view_len = (int)nl;
+                    double cx = (x0 + x1) * 0.5;
+                    view_start = (int)(A.pz_cs - (cx - WAVE_X) / (double)WAVE_W * (double)view_len);
+                    clamp_view(length);
+                    split = 0;
+                }
+            } else if (wn >= 2 && g_mode == 0 && g_state != ST_RECORDING && length > 1 && !A.knob_on && !A.curve_on) {
+                int ka = wi[0], kb = wi[1];
+                A.pz_on = 1; A.pz_id[0] = touch.report[ka].id; A.pz_id[1] = touch.report[kb].id;
+                double xa = touch.report[ka].x / 2.0, xb = touch.report[kb].x / 2.0;
+                A.pz_d0 = fabs(xb - xa) < 12.0 ? 12.0 : fabs(xb - xa);
+                A.pz_len0 = (double)view_len;
+                double cx = (xa + xb) * 0.5;
+                A.pz_cs = (double)view_start + (cx - WAVE_X) / (double)WAVE_W * (double)view_len;
+                split = 0;
+                if (A.scrubbing) {                                  /* первый палец уже скрабил - отпускаем звук */
+                    A.scrubbing = 0; A.scrub_id = -1; g_scrub = 0; g_scrub_vel = 0.0f;
+                    if (A.resume_state == ST_PLAYING) g_seek_to = (int)A.scrub_pos;
+                    else { g_state = ST_IDLE; sceKernelDelayThread(40000); g_play_pos = (int)A.scrub_pos; g_seek_to = -1; }
+                }
+                for (int w = 0; w < 3; w++) A.drag_on[w] = 0;
+                A.sdrag_on = 0;
             }
         }
 
