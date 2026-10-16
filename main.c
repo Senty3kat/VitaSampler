@@ -68,10 +68,10 @@ unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 #define WAVE_H  180
 #define SEG_W   378                            /* ширина мини-дисплея в режиме сплита */
 #define N_WAVE_TEX 4
-#define METER_X 918              /* стеклянная трубка уровня */
-#define METER_Y 74
+#define METER_X 915              /* стеклянная трубка уровня */
+#define METER_Y 80
 #define METER_W 18
-#define METER_H 236
+#define METER_H 228
 #define METER_TICKS 8           /* от 0 до -24 дБ, засечка каждые 3 дБ */
 #define METER_DB 24
 #define PN_X 10
