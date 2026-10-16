@@ -2184,7 +2184,7 @@ enum {
 #define CURVE_X 316
 #define CURVE_Y 410
 #define CURVE_W 340
-#define CURVE_H 114
+#define CURVE_H 104
 
 static void pad_layout(int n, int *cols, int *rows) {
     int r = n <= 4 ? 1 : (n <= 16 ? 2 : 4);
@@ -2274,7 +2274,7 @@ static void knob_text(int k, char *out, size_t cap) {
 
 /* ---------- геометрия кнопок ---------- */
 static int btn_geom(int id, int *x, int *y, int *w, int *h) {
-    if (id >= B_TAB0 && id <= B_TAB4) { *x = 184 + (id - B_TAB0) * 58; *y = 7; *w = 54; *h = 27; return 1; }
+    if (id >= B_TAB0 && id <= B_TAB4) { *x = 214 + (id - B_TAB0) * 58; *y = 7; *w = 54; *h = 27; return 1; }
     if (id >= B_CROP && id <= B_NORM) { *x = 332 + (id - B_CROP) * 126; *y = 384; *w = 90; *h = 90; return 1; }
     if (id >= B_ADV0 && id <= B_ADV3) { *x = 332 + (id - B_ADV0) * 126; *y = 384; *w = 90; *h = 90; return 1; }
     switch (id) {
@@ -2936,8 +2936,9 @@ static void draw_grain_viz(const UiState *u) {
     if (half < 3) half = 3;
     int n = 1 + g_gr_n;
     int lenpx = (int)(20.0f * powf(25.0f, (float)g_gr_size / 100.0f) * 16.0f * pxps);
-    if (lenpx < 10) lenpx = 10;
+    if (lenpx < 28) lenpx = 28;
     if (lenpx > 260) lenpx = 260;
+    rect(xh - half, WAVE_Y, 2 * half, WAVE_H, RGBA8(255, 200, 90, 14));          /* зона разброса: лёгкое облако */
     rect(xh - half, WAVE_Y + 10, 2 * half, 1, RGBA8(255, 224, 90, 200));
     rect(xh - half, WAVE_Y + 5, 1, 11, RGBA8(255, 224, 90, 200));
     rect(xh + half - 1, WAVE_Y + 5, 1, 11, RGBA8(255, 224, 90, 200));
@@ -3044,7 +3045,7 @@ static void ui_draw(const UiState *u) {
 
     /* справка поверх экрана */
     if (u->legend) {
-        rect(CRT_X + 4, CRT_Y + 4, CRT_W - 8, CRT_H - 8, RGBA8(22, 14, 8, 238));
+        rect(CRT_X + 4, CRT_Y + 4, CRT_W - 8, CRT_H - 8, RGBA8(22, 14, 8, 252));
         rect_outline(CRT_X + 4, CRT_Y + 4, CRT_W - 8, CRT_H - 8, 2, K_ORANGE_LO);
         static const char *L[] = {
             "CONTROLS                                                                      (SELECT closes)",
@@ -3136,9 +3137,9 @@ static void ui_draw(const UiState *u) {
         text(796, 466, u->bpm_t != u->bpm_b ? K_ORANGE_LO : K_BROWN, 0.66f, "BPM");
         if (u->bpm > 0) { snprintf(buf, sizeof(buf), "orig %d", u->bpm_b); text(850, 466, K_BROWN_LO, 0.55f, buf); }
     } else if (u->page == 2) {
-        text_c(892, 484, u->gr_on ? K_CREAM_HI : K_BROWN, 0.7f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
-        text_c(892, 504, K_BROWN, 0.55f, "same pitch and speed,");
-        text_c(892, 517, K_BROWN, 0.55f, "fade in / fade out");
+        text_c(885, 471 + ((u->btn_down == B_GR_ON) ? 2 : 0), u->gr_on ? K_CREAM_HI : K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
+        text_c(885, 504, K_BROWN, 0.55f, "same pitch and speed,");
+        text_c(885, 517, K_BROWN, 0.55f, "fade in / fade out");
     } else {
         static const char *sec[2] = { "FILTER", "CRUSH" };
         for (int i = 0; i < 2; i++) {
@@ -3161,10 +3162,9 @@ static void ui_draw(const UiState *u) {
             text(CURVE_X + CURVE_W - 38, CURVE_Y + (int)curve_y_of(0.0f) - 3, K_AMBER_DIM, 0.5f, "0 dB");
             text(CURVE_X + CURVE_W - 44, CURVE_Y + (int)curve_y_of(-12.0f) - 3, K_AMBER_DIM, 0.5f, "-12 dB");
             text(CURVE_X + CURVE_W - 44, CURVE_Y + (int)curve_y_of(-24.0f) - 3, K_AMBER_DIM, 0.5f, "-24 dB");
-            text(690, 520, K_BROWN, 0.55f, "12 dB/oct, no resonance");
-            text(CURVE_X + 6, CURVE_Y + CURVE_H + 14, K_BROWN, 0.5f, "drag in the window: left/right = center, up/down = width");
+            text(CURVE_X + 6, CURVE_Y + CURVE_H + 17, K_BROWN, 0.5f, "drag in the window: left/right = center, up/down = width");
         } else {
-            text(316, 520, K_BROWN, 0.55f, "lo-fi: fewer bits and a lower sample rate");
+            text(560, 391, K_BROWN, 0.58f, "lo-fi: fewer bits and a lower sample rate");
         }
     }
 }

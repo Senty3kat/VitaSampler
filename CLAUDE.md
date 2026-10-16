@@ -11,10 +11,13 @@
 - Сборка VPK — GitHub Actions (`.github/workflows`, контейнер `vitasdk/vitasdk:2026.08`). Логи Actions из сессии
   недоступны (403): причину ошибки видно только по ответу автора. Типичная причина — линковка (freetype требует `bz2`).
   Файлы шрифтов в `vita_create_vpk` — с абсолютным путём `${CMAKE_SOURCE_DIR}/fonts/...`.
-- Проверка без vitasdk: `gcc -fsyntax-only -Wall -Wextra -Wno-unused-parameter -std=gnu99 -I<заглушки psp2/vita2d> main.c`
-  (допустимы только предупреждения про неявные объявления и int-conversion из-за заглушек). Тесты на хосте подключают
-  `main.c` с `-DSAMPLER_NO_MAIN` и линкуются с `-Wl,--unresolved-symbols=ignore-all`: движок (фильтр, гранулы, «метрика
-  щелчков» — максимум второй разности выхода), отрисовка холстов в PNG для просмотра глазами.
+- Проверка без vitasdk (папка `host/`): `make -C host check` — строгая проверка синтаксиса `main.c` с заглушками SDK
+  (`host/stub`, сигнатуры как в vitasdk; неявные объявления и int-conversion — ошибки). `make -C host preview` собирает
+  хост-версию с программным рендером (`host/preview.c`: ui_draw рисуется в буфер, текст через FreeType) и кладёт
+  PNG экранов в `/tmp/shots/` (edit, slice, grain, fx_filter, fx_crush, adv, help, empty, rec) — СМОТРЕТЬ глазами перед
+  коммитом. Новые вызовы vita2d/psp2 сначала добавить в `host/stub` с точной сигнатурой из vitasdk.
+  Тесты движка подключают `main.c` с `-DSAMPLER_NO_MAIN` и линкуются с `-Wl,--unresolved-symbols=ignore-all`
+  (фильтр, гранулы, «метрика щелчков» — максимум второй разности выхода).
 - Автор тестирует на настоящей Vita; правки дизайна приходят со скриншотами и референсами. Всегда писать, что на Vita
   не проверялось, и давать чек-лист, что проверить.
 - Коммит в `main`, в конце сообщения: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` и строка `Claude-Session: ...`.
