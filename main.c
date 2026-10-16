@@ -68,10 +68,12 @@ unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 #define WAVE_H  180
 #define SEG_W   378                            /* ширина мини-дисплея в режиме сплита */
 #define N_WAVE_TEX 4
-#define METER_X 930              /* стеклянная трубка уровня */
+#define METER_X 918              /* стеклянная трубка уровня */
 #define METER_Y 74
 #define METER_W 18
 #define METER_H 236
+#define METER_TICKS 8           /* от 0 до -24 дБ, засечка каждые 3 дБ */
+#define METER_DB 24
 #define PN_X 10
 #define PN_Y 362
 #define PN_W 938
@@ -2438,7 +2440,7 @@ typedef struct {
 /* градиент трубки уровня: внизу тёплый жёлтый, выше оранжевый, наверху красно-оранжевый; объём - тенью по ширине */
 static void meter_render(Canvas *c) {
     static const float pos[5] = { 0.0f, 0.35f, 0.62f, 0.86f, 1.0f };
-    static const int col[5][3] = { { 255, 214, 50 }, { 255, 176, 28 }, { 255, 132, 20 }, { 246, 84, 18 }, { 226, 40, 18 } };
+    static const int col[5][3] = { { 255, 180, 34 }, { 255, 150, 26 }, { 255, 118, 20 }, { 246, 80, 18 }, { 226, 40, 18 } };
     for (int y = 0; y < c->h; y++) {
         float t = 1.0f - (float)y / (float)(c->h - 1);
         int k = 0;
@@ -2447,11 +2449,42 @@ static void meter_render(Canvas *c) {
         float r = col[k][0] + (col[k + 1][0] - col[k][0]) * f, g = col[k][1] + (col[k + 1][1] - col[k][1]) * f, b = col[k][2] + (col[k + 1][2] - col[k][2]) * f;
         for (int x = 0; x < c->w; x++) {
             float u = ((float)x + 0.5f) / (float)c->w * 2.0f - 1.0f;
-            float sh = 1.0f - 0.42f * u * u + ((u < -0.15f && u > -0.65f) ? 0.2f : 0.0f);
+            float sh = 1.0f - 0.30f * u * u;
             int rr = (int)(r * sh), gg = (int)(g * sh), bb = (int)(b * sh);
             c->px[y * c->w + x] = RGBA8(rr > 255 ? 255 : rr, gg > 255 ? 255 : gg, bb > 255 ? 255 : bb, 255);
         }
     }
+}
+
+/* стекло поверх трубки (размер METER_W+8 x METER_H+8): тень от оправы, блик сверху, вертикальный отсвет, нижний отсвет */
+static void meter_glass_render(Canvas *c) {
+    int w = c->w, h = c->h;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            float fx = (float)(x - 4) / (float)METER_W, fy = (float)(y - 4) / (float)METER_H;   /* 0..1 внутри трубки */
+            float a = 0.0f, wr = 0.0f;
+            /* внутренняя тень под оправой */
+            float dtop = (float)(y - 4), dl = (float)(x - 4), dr = (float)(METER_W - 1 - (x - 4));
+            if (dtop < 9.0f) a += 0.55f * (1.0f - dtop / 9.0f) * (1.0f - dtop / 9.0f);
+            if (dl < 3.0f) a += 0.35f * (1.0f - dl / 3.0f);
+            if (dr < 3.0f) a += 0.35f * (1.0f - dr / 3.0f);
+            if (a > 0.8f) a = 0.8f;
+            if (x >= 4 && x < 4 + METER_W && y >= 4 && y < 4 + METER_H && a > 0.0f) cv_put(c, x, y, RGBA8(0, 0, 0, 255), a);
+            /* блик: светлая полоса вдоль левой трети, затухает к краям */
+            if (x >= 4 && x < 4 + METER_W && y >= 4 && y < 4 + METER_H) {
+                float sx = (fx - 0.28f) / 0.09f, hx = expf(-sx * sx);
+                float vy = fy < 0.06f ? fy / 0.06f : (fy > 0.7f ? (1.0f - fy) / 0.3f : 1.0f);
+                if (vy < 0.0f) vy = 0.0f;
+                wr = 0.26f * hx * vy;
+                float gl = fy < 0.14f ? (1.0f - fy / 0.14f) * 0.16f : 0.0f;         /* общий блик сверху */
+                wr += gl;
+                float sy = (fy - 0.97f) / 0.015f;                                    /* тонкий отсвет у дна */
+                wr += 0.22f * expf(-sy * sy) * (fx > 0.1f && fx < 0.9f ? 1.0f : 0.0f);
+                if (wr > 0.0f) cv_put(c, x, y, RGBA8(255, 255, 255, 255), wr);
+            }
+        }
+    /* стеклянная кромка */
+    cv_rrect_stroke(c, 3.5f, 3.5f, (float)METER_W + 1.0f, (float)METER_H + 1.0f, 3.0f, 1.0f, RGBA8(255, 255, 255, 60));
 }
 
 /* ====================================================================
@@ -2498,20 +2531,17 @@ static void skin_render_static(Canvas *c) {
     cv_rrect_stroke(c, 899, 49, 50, 20, 3, 1.0f, RGBA8(10, 6, 4, 255));
     cv_rrect(c, 899, 318, 50, 26, 3, RGBA8(24, 15, 10, 255));             /* окно пика */
     cv_rrect_stroke(c, 899, 318, 50, 26, 3, 1.0f, RGBA8(10, 6, 4, 255));
-    cv_rrect(c, METER_X - 3, METER_Y - 3, METER_W + 6, METER_H + 6, 5, RGBA8(30, 26, 22, 255));
-    cv_rrect(c, METER_X - 1, METER_Y - 1, METER_W + 2, METER_H + 2, 4, RGBA8(10, 8, 6, 255));
-    for (int x = 0; x < METER_W; x++) {                                    /* пустая часть: тёмное стекло */
+    /* окошко трубки: врезанная оправа со светлой кромкой, внутри тёмная пустая трубка */
+    cv_rrect(c, METER_X - 6, METER_Y - 5, METER_W + 12, METER_H + 12, 6, RGBA8(255, 255, 255, 120));     /* светлая кромка снизу-справа */
+    cv_rrect(c, METER_X - 6, METER_Y - 6, METER_W + 12, METER_H + 11, 6, RGBA8(96, 88, 72, 255));
+    cv_rrect(c, METER_X - 4, METER_Y - 4, METER_W + 8, METER_H + 8, 5, RGBA8(26, 22, 18, 255));
+    for (int x = 0; x < METER_W; x++) {                                    /* пустая часть: симметричная тёмная трубка */
         float u = ((float)x + 0.5f) / (float)METER_W * 2.0f - 1.0f;
-        float sh = 1.0f - 0.45f * u * u + (u < -0.2f && u > -0.7f ? 0.18f : 0.0f);
+        float sh = 1.0f - 0.30f * u * u;
         for (int y = 0; y < METER_H; y++) {
-            float gy = 0.85f + 0.15f * (float)y / (float)METER_H;
-            int v = (int)(70.0f * sh * gy);
+            int v = (int)(58.0f * sh);
             c->px[(METER_Y + y) * c->w + METER_X + x] = RGBA8(v, v - 5 > 0 ? v - 5 : 0, v - 10 > 0 ? v - 10 : 0, 255);
         }
-    }
-    for (int k = 0; k <= 10; k++) {                                        /* засечки каждые 6 дБ, длинные каждые 12 */
-        int yy = METER_Y + k * (METER_H - 1) / 10;
-        cv_rect(c, METER_X - 9 + (k % 2 ? 4 : 0), yy, (k % 2 ? 4 : 8), 1, RGBA8(90, 80, 66, 255));
     }
 
     /* панель управления */
@@ -2804,7 +2834,8 @@ static int g_wcodes[5][W_COUNT], g_page_keys[5] = { -1, -1, -1, -1, -1 }, g_last
 static uint32_t g_sig_top = 0;
 static int g_top_cur = -1, g_ctl_cur = -1, g_top_next = 0, g_ctl_next = 0;
 
-static Canvas g_cv_meter;
+static Canvas g_cv_meter, g_cv_mglass;
+static vita2d_texture *g_tex_mglass = NULL;
 
 static void upload_canvas(vita2d_texture *tex, const Canvas *c) {
     if (!tex) return;
@@ -2818,6 +2849,8 @@ static void ui_create_textures(void) {
     g_tex_glass = vita2d_create_empty_texture(CRT_W, CRT_H);
     g_tex_meter = vita2d_create_empty_texture(METER_W, METER_H);
     upload_canvas(g_tex_meter, &g_cv_meter);
+    g_tex_mglass = vita2d_create_empty_texture(METER_W + 8, METER_H + 8);
+    upload_canvas(g_tex_mglass, &g_cv_mglass);
     for (int i = 0; i < 2; i++) g_tex_top[i] = vita2d_create_empty_texture(SCR_W, TOP_H);
     for (int i = 0; i < 3; i++) g_tex_ctl[i] = vita2d_create_empty_texture(SCR_W, CTL_TH);
     upload_canvas(g_tex_bg, &g_cv_bg);
@@ -2843,6 +2876,9 @@ static int ui_init(void) {
     g_cv_meter.w = METER_W; g_cv_meter.h = METER_H; g_cv_meter.px = (uint32_t *)calloc((size_t)METER_W * METER_H, 4);
     if (!g_cv_meter.px) return 0;
     meter_render(&g_cv_meter);
+    g_cv_mglass.w = METER_W + 8; g_cv_mglass.h = METER_H + 8; g_cv_mglass.px = (uint32_t *)calloc((size_t)(METER_W + 8) * (METER_H + 8), 4);
+    if (!g_cv_mglass.px) return 0;
+    meter_glass_render(&g_cv_mglass);
     skin_render_static(&g_cv_bg);
     glass_render(&g_cv_glass);
     ui_create_textures();
@@ -2853,6 +2889,7 @@ static void ui_free_textures(void) {
     if (g_tex_bg) { vita2d_free_texture(g_tex_bg); g_tex_bg = NULL; }
     if (g_tex_glass) { vita2d_free_texture(g_tex_glass); g_tex_glass = NULL; }
     if (g_tex_meter) { vita2d_free_texture(g_tex_meter); g_tex_meter = NULL; }
+    if (g_tex_mglass) { vita2d_free_texture(g_tex_mglass); g_tex_mglass = NULL; }
     for (int i = 0; i < 2; i++) if (g_tex_top[i]) { vita2d_free_texture(g_tex_top[i]); g_tex_top[i] = NULL; }
     for (int i = 0; i < 3; i++) if (g_tex_ctl[i]) { vita2d_free_texture(g_tex_ctl[i]); g_tex_ctl[i] = NULL; }
 }
@@ -2897,6 +2934,7 @@ static void ui_update_textures(const UiState *u) {
  * ==================================================================== */
 static int tw(const char *s, float sc) { return text_w(s, sc); }
 static void text_c(int cx, int y, unsigned int col, float sc, const char *s) { text(cx - tw(s, sc) / 2, y, col, sc, s); }
+static void text_r(int rx, int y, unsigned int col, float sc, const char *s) { text(rx - tw(s, sc), y, col, sc, s); }
 
 /* курсоры, область между ними, головка воспроизведения */
 static void draw_overlays(const UiState *u) {
@@ -3162,22 +3200,27 @@ static void ui_draw(const UiState *u) {
 
     /* индикатор уровня: сплошной градиент в стеклянной трубке, пик, засечки, окна */
     {
-        int lit = u->level_pct * METER_H / 100;
+        int lit = u->level_pct * METER_H / 1000;
         if (lit > METER_H) lit = METER_H;
         if (lit > 0 && g_tex_meter)
             vita2d_draw_texture_part(g_tex_meter, (float)METER_X, (float)(METER_Y + METER_H - lit), 0.0f, (float)(METER_H - lit), (float)METER_W, (float)lit);
-        int ph = u->peak_pct * METER_H / 100;
-        if (ph > 2 && ph <= METER_H) rect(METER_X, METER_Y + METER_H - ph, METER_W, 2, RGBA8(255, 236, 176, 235));
-        for (int k = 0; k <= 10; k += 2) {
+        int ph = u->peak_pct * METER_H / 1000;
+        if (ph > 1 && ph <= METER_H) rect(METER_X, METER_Y + METER_H - ph, METER_W, 2, RGBA8(255, 236, 176, 235));
+        for (int k = 0; k <= METER_TICKS; k += 2) {
             char nb[8];
-            snprintf(nb, sizeof(nb), "%d", k * 6);
-            text(901, METER_Y + k * (METER_H - 1) / 10 + 4, K_BROWN, 0.5f, nb);
+            snprintf(nb, sizeof(nb), "%d", k * (METER_DB / METER_TICKS));
+            text_r(METER_X - 9, METER_Y + k * (METER_H - 1) / METER_TICKS + 4, K_BROWN, 0.5f, nb);
         }
-        rect(METER_X + 2, METER_Y, 3, METER_H, RGBA8(255, 255, 255, 20));       /* блик на стекле */
+        for (int k = 0; k <= METER_TICKS; k++) {                       /* засечки каждые 3 дБ на краях трубки (поверх заливки) */
+            int yy = METER_Y + k * (METER_H - 1) / METER_TICKS, tl = (k % 2 == 0) ? 5 : 3;
+            rect(METER_X, yy, tl, 1, RGBA8(20, 12, 6, 150));
+            rect(METER_X + METER_W - tl, yy, tl, 1, RGBA8(20, 12, 6, 150));
+        }
+        if (g_tex_mglass) vita2d_draw_texture(g_tex_mglass, METER_X - 4, METER_Y - 4);   /* стекло поверх трубки */
         if (u->clip > 0) { rect(899, 49, 50, 20, RGBA8(214, 32, 20, 255)); text_c(924, 63, K_CREAM_HI, 0.62f, "CLIP"); }
         else text_c(924, 63, RGBA8(120, 78, 40, 255), 0.62f, "CLIP");
         if (u->peak_pct > 0) {
-            int d10 = (u->peak_pct * 600 / 100) - 600;
+            int d10 = (u->peak_pct * METER_DB * 10 / 1000) - METER_DB * 10;
             char pb[12];
             snprintf(pb, sizeof(pb), "%d.%d", d10 / 10, abs(d10) % 10);
             text_c(924, 336, RGBA8(255, 138, 40, 255), 0.7f, pb);
@@ -3885,7 +3928,15 @@ static void perform_hit(int hit) {
 /* ====================================================================
  *  Главная программа
  * ==================================================================== */
-static int level_from_peak(int peak) { return level_percent(peak); }
+/* уровень для трубки: 0..1000 на диапазон 0...-METER_DB дБ */
+static int level_from_peak(int peak) {
+    if (peak <= 0) return 0;
+    float db = 20.0f * log10f((float)peak / 32768.0f);
+    float p = (db + (float)METER_DB) / (float)METER_DB;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    return (int)(p * 1000.0f);
+}
 
 #ifndef SAMPLER_NO_MAIN
 int main(void) {
@@ -4586,11 +4637,13 @@ int main(void) {
         int lvl = (state == ST_IDLE) ? 0 : level_from_peak(g_level);
         if (g_level >= 32000 && state != ST_IDLE) clip_hold = 60;
         if (clip_hold > 0) clip_hold--;
-        if (lvl > shown_level) shown_level = lvl;
-        else shown_level = shown_level * 88 / 100;
+        if (lvl > shown_level) shown_level += (lvl - shown_level) * 40 / 100 + 1;      /* быстро вверх, но не рывком */
+        else shown_level -= (shown_level - lvl) * 7 / 100 + 3;                          /* медленно вниз */
+        if (shown_level > 1000) shown_level = 1000;
+        if (shown_level < 0) shown_level = 0;
         if (lvl >= peak_hold) { peak_hold = lvl; peak_f = 75; }      /* пик держится 1.2 с, потом медленно падает */
         else if (peak_f > 0) peak_f--;
-        else peak_hold = peak_hold * 97 / 100;
+        else { peak_hold -= 4; if (peak_hold < 0) peak_hold = 0; }
 
         /* ---- данные для рисования ---- */
         UiState u;

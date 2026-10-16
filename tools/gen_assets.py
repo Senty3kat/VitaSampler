@@ -79,31 +79,31 @@ def knob_body(R, active):
     d = np.hypot(x, y - 2.2)                                                       # тень: короткая и плотная
     over(img, C((40, 28, 16)), 0.42 * np.clip((R + 4.4 - d) / 3.2, 0, 1) ** 1.3)
     light = 0.5 + 0.5 * np.cos(th + 2.356)                                         # свет сверху-слева
-    # юбка (металлическое кольцо у основания)
-    if active:
-        skirt = lerp((170, 62, 16), (255, 176, 92), light)
-    else:
-        skirt = lerp((110, 112, 114), (236, 238, 240), light ** 1.2)
-    over(img, skirt, cover(r - (R + 3.4)))
-    over(img, C((50, 50, 52)), 0.8 * cover(np.abs(r - (R + 3.4)) - 0.4))
-    over(img, C((40, 38, 34)), 0.9 * cover(np.abs(r - (R + 1.2)) - 0.4))           # щель между юбкой и корпусом
-    # многогранный корпус
     N = 10
     sec = 2 * np.pi / N
     off = 0.3
     ang = np.mod(th - off, 2 * np.pi)
     k = np.floor(ang / sec)
     loc = ang - k * sec - sec / 2
-    Rp = R + 1.0
-    dpoly = r * np.cos(loc) - Rp * np.cos(sec / 2)
+    def poly(Rc):
+        return r * np.cos(loc) - Rc * np.cos(sec / 2)
+    Rp = R + 2.2                                                                   # многогранный корпус (острые рёбра)
+    # юбка — тоже многогранник, чуть шире корпуса
+    if active:
+        skirt = lerp((170, 62, 16), (255, 176, 92), light)
+    else:
+        skirt = lerp((110, 112, 114), (236, 238, 240), light ** 1.2)
+    over(img, skirt, cover(poly(Rp + 1.5)))
+    over(img, C((50, 50, 52)), 0.85 * cover(np.abs(poly(Rp + 1.5)) - 0.4))
+    over(img, C((40, 38, 34)), 0.9 * cover(np.abs(poly(Rp - 0.1)) - 0.4))
     face_ang = off + (k + 0.5) * sec
     fl = 0.5 + 0.5 * np.cos(face_ang + 2.356)                                      # яркость грани: плоская на всю грань
     plastic = lerp((128, 126, 116), (232, 230, 216), fl ** 1.1)
-    over(img, plastic, cover(dpoly))
-    # рёбра между гранями: тонкие тёмные и светлые линии
-    ed = np.abs(loc) > sec / 2 - 0.035
-    over(img, C((70, 68, 60)), 0.55 * ed * (r > 0.8 * R) * cover(dpoly + 0.2))
-    over(img, C((255, 255, 255)), 0.22 * (np.abs(np.abs(loc) - (sec / 2 - 0.075)) < 0.02) * (r > 0.8 * R) * cover(dpoly + 0.2) * (fl > 0.5))
+    over(img, plastic, cover(poly(Rp - 0.6)))
+    dpoly = poly(Rp - 0.6)
+    ed = np.abs(loc) > sec / 2 - 0.03
+    over(img, C((70, 68, 60)), 0.6 * ed * (r > 0.8 * R) * cover(dpoly + 0.2))
+    over(img, C((255, 255, 255)), 0.25 * (np.abs(np.abs(loc) - (sec / 2 - 0.07)) < 0.02) * (r > 0.8 * R) * cover(dpoly + 0.2) * (fl > 0.5))
     # верхняя площадка пластика (фаска от граней) и диск из шлифованного металла
     ri = 0.80 * R
     over(img, lerp((214, 212, 200), (170, 168, 156), np.clip((r / ri), 0, 1) ** 2), cover(r - ri))

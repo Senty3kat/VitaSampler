@@ -80,7 +80,7 @@ static void scene(UiState *u, int page, int mode, int state) {
     u->page = page; u->mode = mode; u->state = state; u->loop = 1; u->fx_sec = 0;
     u->length = len; u->playhead = len / 3; u->split = 0;
     u->c1 = len * 0.2; u->c2 = len * 0.75; u->active = 0;
-    u->level_pct = 72; u->peak_pct = 84; u->clip = 0;
+    u->level_pct = 640; u->peak_pct = 780; u->clip = 0;
     snprintf(u->msg, sizeof(u->msg), "Loop ON");
     u->sl_n = 8; u->sl_sel = 2; u->sl_playing = (state == ST_PLAYING && mode == 1) ? 2 : -1;
     u->can_undo = 1; u->bpm = 124; u->bpm_t = 124; u->bpm_b = 120;
