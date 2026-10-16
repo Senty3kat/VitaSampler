@@ -2128,7 +2128,7 @@ static void cv_icon(Canvas *c, int kind, float cx, float cy, uint32_t col) {
 static void cv_key(Canvas *c, int x, int y, int w, int h, int style, int pressed) {
     if (g_img_keys.px && style != 2) {
         int col = style == 1 ? 1 : (style == 3 ? 2 : (style == 4 ? 3 : 0));
-        cv_blit9(c, &g_img_keys, col * 52, pressed ? 52 : 0, 52, 20, x - 8, y - 5, w + 16, h + 16);
+        cv_blit9(c, &g_img_keys, col * 52, pressed ? 52 : 0, 52, 22, x - 8, y - 5, w + 16, h + 16);
         return;
     }
     uint32_t top, bot, edge, side;
@@ -3203,7 +3203,7 @@ static void ui_draw(const UiState *u) {
             int x, y, w, h;
             btn_geom(id, &x, &y, &w, &h);
             int st = edit_style(u, id), pr = (u->btn_down == id);
-            text_c(x + w / 2, y + h - 11 + (pr ? 2 : 0), st ? K_CREAM_HI : ((id == B_UNDO && !u->can_undo) ? K_BROWN_LO : K_BROWN), 0.68f, names[id - B_CROP]);
+            text_c(x + w / 2, y + h - 18 + (pr ? 2 : 0), st ? K_CREAM_HI : ((id == B_UNDO && !u->can_undo) ? K_BROWN_LO : K_BROWN), 0.68f, names[id - B_CROP]);
         }
         text(332, 500, K_BROWN, 0.58f, "SELECT help     START save WAV     TRIANGLE x2 reset A-B");
         text(332, 514, K_BROWN, 0.58f, "hold L = glitch (rear panel: up / down = rate)     drag a knob: up / down");
@@ -3212,7 +3212,7 @@ static void ui_draw(const UiState *u) {
         for (int id = B_ADV0; id <= B_ADV3; id++) {
             int x, y, w, h;
             btn_geom(id, &x, &y, &w, &h);
-            text_c(x + w / 2, y + h - 11 + ((u->btn_down == id) ? 2 : 0), K_BROWN, 0.66f, an[id - B_ADV0]);
+            text_c(x + w / 2, y + h - 18 + ((u->btn_down == id) ? 2 : 0), K_BROWN, 0.66f, an[id - B_ADV0]);
         }
         text(332, 500, K_BROWN, 0.58f, "all four work on the region A-B chosen in EDIT");
         text(332, 514, K_BROWN, 0.58f, "+ SILENCE inserts a gap of the same width right after B     UNDO is in EDIT");
@@ -3230,7 +3230,7 @@ static void ui_draw(const UiState *u) {
         text(796, 466, u->bpm_t != u->bpm_b ? K_ORANGE_LO : K_BROWN, 0.66f, "BPM");
         if (u->bpm > 0) { snprintf(buf, sizeof(buf), "orig %d", u->bpm_b); text(850, 466, K_BROWN_LO, 0.55f, buf); }
     } else if (u->page == 2) {
-        text_c(885, 471 + ((u->btn_down == B_GR_ON) ? 2 : 0), u->gr_on ? K_CREAM_HI : K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
+        text_c(885, 461 + ((u->btn_down == B_GR_ON) ? 2 : 0), u->gr_on ? K_CREAM_HI : K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
         text_c(885, 504, K_BROWN, 0.55f, "same pitch and speed,");
         text_c(885, 517, K_BROWN, 0.55f, "fade in / fade out");
     } else {
@@ -3247,7 +3247,7 @@ static void ui_draw(const UiState *u) {
                 int x, y, w, h;
                 btn_geom(B_FT0 + i, &x, &y, &w, &h);
                 int sel = (u->flt_type == i);
-                text_c(x + w / 2, y + h - 8 + (sel ? 2 : 0), sel ? K_CREAM_HI : K_BROWN, 0.62f, ft[i]);
+                text_c(x + w / 2, y + h - 15 + (sel ? 2 : 0), sel ? K_CREAM_HI : K_BROWN, 0.62f, ft[i]);
             }
             static const char *fl[3] = { "100 Hz", "1 kHz", "4 kHz" };
             static const float ff[3] = { 100.0f, 1000.0f, 4000.0f };

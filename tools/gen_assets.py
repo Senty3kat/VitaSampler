@@ -67,7 +67,7 @@ KBOX = 88            # клетка спрайта ручки: центр в (44
 
 
 def knob_body(R, active):
-    """Светлая рифлёная ручка (алюминий/кремовый пластик, как на приборах 70-х), тёмная юбка."""
+    """Ручка как на С1-65: многогранный корпус (10 граней, у каждой свой тон), металлический диск сверху, юбка из металла."""
     S = KBOX
     img = new(S, S)
     x, y = grid(S, S)
@@ -76,36 +76,44 @@ def knob_body(R, active):
     r = np.hypot(x, y)
     th = np.arctan2(y, x)
     C = lambda c: np.full(img.shape[:2] + (3,), c, np.float32)
-    d = np.hypot(x, y - 3.0)                                                       # тень на панели
-    over(img, C((60, 42, 24)), 0.38 * np.clip((R + 4.8 - d) / 7.0, 0, 1) ** 1.6)
+    d = np.hypot(x, y - 2.2)                                                       # тень: короткая и плотная
+    over(img, C((40, 28, 16)), 0.42 * np.clip((R + 4.4 - d) / 3.2, 0, 1) ** 1.3)
     light = 0.5 + 0.5 * np.cos(th + 2.356)                                         # свет сверху-слева
+    # юбка (металлическое кольцо у основания)
     if active:
-        skirt = lerp((150, 54, 14), (252, 168, 84), light)
+        skirt = lerp((170, 62, 16), (255, 176, 92), light)
     else:
-        skirt = lerp((46, 44, 40), (150, 146, 134), light ** 1.4)
+        skirt = lerp((110, 112, 114), (236, 238, 240), light ** 1.2)
     over(img, skirt, cover(r - (R + 3.4)))
-    over(img, C((30, 28, 24)), 0.85 * cover(np.abs(r - (R + 0.7)) - 0.5))
-    # рифлёная боковая стенка: глубокие рёбра, свет по окружности
-    Rb = R + 0.2
-    rt = Rb - 4.6                                                                  # край верхней площадки
-    n_rib = int(R * 1.5) // 2 * 2 + 12
-    ph = 0.5 + 0.5 * np.cos(th * n_rib)
-    base = lerp((120, 116, 104), (246, 243, 232), light ** 0.9)
-    wall = base * (0.70 + 0.30 * ph)[..., None] - 26 * (1 - ph)[..., None] * (1 - light)[..., None]
-    over(img, wall, cover(r - Rb))
-    # верхняя площадка: светлый алюминий, радиальный градиент + токарные кольца
-    u, v = (x + 0.28 * R) / R, (y + 0.34 * R) / R
-    t = np.clip(np.hypot(u, v) / 1.35, 0, 1)
-    top = lerp((255, 253, 244), (176, 170, 154), t ** 1.1)
-    top = top + 4.0 * np.sin(r * 8.0)[..., None] * smooth(0.15 * R, 0.5 * R, r)[..., None]
-    spin = np.maximum(0, np.cos(2 * (th + 0.75))) ** 6                             # угловой «шлифованный» блик
-    top = top + 14 * spin[..., None] * smooth(0.1 * R, 0.55 * R, r)[..., None]
-    over(img, top, cover(r - rt))
-    over(img, C((96, 90, 74)), 0.75 * cover(np.abs(r - rt) - 0.5))                 # кромка площадки
-    over(img, C((255, 255, 255)), 0.55 * cover(np.abs(r - rt + 0.9) - 0.4) * (light > 0.45))
-    over(img, C((120, 112, 94)), 0.35 * cover(np.abs(r - 0.5 * R) - 0.5))          # центральная проточка
-    over(img, C((255, 255, 255)), 0.5 * cover(np.abs(r - 0.5 * R - 0.9) - 0.4) * (light > 0.4))
-    over(img, C((255, 255, 255)), 0.28 * np.clip(1 - np.hypot(x + 0.34 * R, y + 0.42 * R) / (0.42 * R), 0, 1) ** 1.5)
+    over(img, C((50, 50, 52)), 0.8 * cover(np.abs(r - (R + 3.4)) - 0.4))
+    over(img, C((40, 38, 34)), 0.9 * cover(np.abs(r - (R + 1.2)) - 0.4))           # щель между юбкой и корпусом
+    # многогранный корпус
+    N = 10
+    sec = 2 * np.pi / N
+    off = 0.3
+    ang = np.mod(th - off, 2 * np.pi)
+    k = np.floor(ang / sec)
+    loc = ang - k * sec - sec / 2
+    Rp = R + 1.0
+    dpoly = r * np.cos(loc) - Rp * np.cos(sec / 2)
+    face_ang = off + (k + 0.5) * sec
+    fl = 0.5 + 0.5 * np.cos(face_ang + 2.356)                                      # яркость грани: плоская на всю грань
+    plastic = lerp((128, 126, 116), (232, 230, 216), fl ** 1.1)
+    over(img, plastic, cover(dpoly))
+    # рёбра между гранями: тонкие тёмные и светлые линии
+    ed = np.abs(loc) > sec / 2 - 0.035
+    over(img, C((70, 68, 60)), 0.55 * ed * (r > 0.8 * R) * cover(dpoly + 0.2))
+    over(img, C((255, 255, 255)), 0.22 * (np.abs(np.abs(loc) - (sec / 2 - 0.075)) < 0.02) * (r > 0.8 * R) * cover(dpoly + 0.2) * (fl > 0.5))
+    # верхняя площадка пластика (фаска от граней) и диск из шлифованного металла
+    ri = 0.80 * R
+    over(img, lerp((214, 212, 200), (170, 168, 156), np.clip((r / ri), 0, 1) ** 2), cover(r - ri))
+    over(img, C((82, 80, 72)), 0.7 * cover(np.abs(r - ri) - 0.45))
+    rm = 0.66 * R
+    sheen = np.maximum(0, np.cos(2 * (th + 0.8))) ** 3
+    metal = lerp((176, 178, 180), (236, 238, 240), sheen) + 5 * np.sin(th * 48)[..., None]
+    over(img, metal, cover(r - rm))
+    over(img, C((70, 70, 72)), 0.85 * cover(np.abs(r - rm) - 0.45))
+    over(img, C((255, 255, 255)), 0.55 * cover(np.abs(r - rm + 0.9) - 0.35) * (light > 0.5))
     return down(img)
 
 
@@ -116,10 +124,10 @@ def knob_pointer(R):
     x, y = grid(S, S)
     x -= S / 2
     y -= S / 2
-    w, y0, y1 = 3.4, -0.90 * R, -0.18 * R
-    sdr = lambda dx, dy: rrect_sd(x - dx, y - dy, -w / 2, y0, w, y1 - y0, w / 2)
-    over(img, np.full(img.shape[:2] + (3,), (255, 255, 255), np.float32), 0.6 * cover(sdr(0.6, 0.9)))
-    over(img, lerp((92, 72, 56), (50, 38, 30), (x + w / 2) / w), cover(sdr(0, 0)))
+    w, y0, y1 = 2.6, -0.62 * R, -0.06 * R
+    sdr = lambda dx, dy: rrect_sd(x - dx, y - dy, -w / 2, y0, w, y1 - y0, 0.6)
+    over(img, np.full(img.shape[:2] + (3,), (255, 255, 255), np.float32), 0.7 * cover(sdr(0.5, 0.7)))
+    over(img, np.full(img.shape[:2] + (3,), (34, 30, 28), np.float32), cover(sdr(0, 0)))
     return down(img)
 
 
@@ -151,13 +159,13 @@ def key_sprite(style, pressed):
     off = 2.0 if pressed else 0.0
     bx, by, bw, bh = 8.0, 5.0 + off, 36.0, 36.0
     # гнездо: тёмная тень вокруг основания
-    sds = rrect_sd(x, y, bx - 1.5, by - 0.5 + 1.5, bw + 3.0, bh + 1.0, 5.5)
-    over(img, C((18, 14, 10)), 0.40 * np.clip(1 - sds / 4.5, 0, 1) ** 1.7 * (sds > -1.5))
+    sds = rrect_sd(x, y, bx - 1.0, by - 0.5 + 1.2, bw + 2.0, bh + 1.0, 5.0)
+    over(img, C((18, 14, 10)), 0.55 * np.clip(1 - sds / 2.2, 0, 1) ** 1.2 * (sds > -1.0))
     # основание кейкапа (внешний контур)
     sdo = rrect_sd(x, y, bx, by, bw, bh, 4.5)
     # верхняя грань: уже основания; снизу — высокая передняя стенка
-    li, ri, ti = 4.5, 4.5, 3.0
-    fw = 4.0 if pressed else 10.0
+    li, ri, ti = 5.5, 5.5, 3.5
+    fw = 5.0 if pressed else 12.0
     tx0, ty0, tw, th_ = bx + li, by + ti, bw - li - ri, bh - ti - fw
     sdt = rrect_sd(x, y, tx0, ty0, tw, th_, 3.4)
     # стенки: ориентация определяется положением относительно верхней грани
@@ -177,11 +185,13 @@ def key_sprite(style, pressed):
     cx_ = tx0 + tw / 2
     nxx = np.clip(np.abs(x - cx_) / (tw / 2), 0, 1)
     dish = np.clip(1 - np.abs(g * 2 - 1) ** 2.0, 0, 1) * (1 - nxx ** 2)
-    face = face * (1 - 0.08 * dish)[..., None]
+    face = face * (1 - 0.13 * dish)[..., None]
     over(img, face, cover(sdt))
     over(img, C(edge), 0.45 * cover(np.abs(sdt) - 0.45))           # кромка верхней грани
     over(img, C((255, 255, 255)), 0.30 * cover(np.abs(sdt + 0.9) - 0.4) * (g < 0.5))   # светлая фаска сверху
     over(img, C(edge), cover(np.abs(sdo) - 0.5))
+    if not pressed:                                                # резкая светлая грань на стыке верха и передней стенки
+        over(img, C((255, 255, 255)), 0.55 * cover(rrect_sd(x, y, tx0 + 1.5, ty0 + th_ - 0.2, tw - 3, 1.0, 0.4)))
     out = down(img)
     rng = np.random.default_rng(7 + style * 3 + pressed)
     n = rng.normal(0, 1.3, out.shape[:2])[..., None]
