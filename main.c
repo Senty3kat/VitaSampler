@@ -1882,7 +1882,7 @@ typedef struct { uint32_t *px; int w, h; } Canvas;
 #define ASSET_PREFIX "app0:assets/"
 #endif
 typedef struct { uint32_t *px; int w, h; } Img;
-static Img g_img_knobs, g_img_keys, g_img_lamps;
+static Img g_img_knobs, g_img_keys, g_img_lamps, g_img_body;
 
 static int img_load(Img *im, const char *name) {
     char path[256];
@@ -1903,6 +1903,7 @@ static void assets_init(void) {
     img_load(&g_img_knobs, "knobs.png");
     img_load(&g_img_keys, "keys.png");
     img_load(&g_img_lamps, "lamps.png");
+    img_load(&g_img_body, "body.png");
 }
 
 static inline float fclampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -2491,11 +2492,15 @@ static void meter_glass_render(Canvas *c) {
  *  Статичный фон (рисуется один раз): корпус, стеклянное окно с ЭЛТ, панель
  * ==================================================================== */
 static void skin_render_static(Canvas *c) {
+    int have_body = g_img_body.px && g_img_body.w == c->w && g_img_body.h == c->h;
+    if (have_body) memcpy(c->px, g_img_body.px, (size_t)c->w * c->h * 4);
+    else {
     for (int y = 0; y < c->h; y++) {
         uint32_t col = lerp_col(RGBA8(237, 233, 221, 255), RGBA8(222, 217, 203, 255), (float)y / (float)c->h);
         for (int x = 0; x < c->w; x++) c->px[y * c->w + x] = col;
     }
     cv_noise(c, 0, 0, c->w, c->h, 3);
+    }
 
     /* верхняя планка */
     cv_rect(c, 0, 40, SCR_W, 1, K_EDGE);
@@ -2525,8 +2530,10 @@ static void skin_render_static(Canvas *c) {
     for (int i = 1; i < 16; i++) cv_rect(c, WAVE_X + i * WAVE_W / 16, WAVE_Y, 1, WAVE_H, RGBA8(255, 150, 46, 20));
 
     /* индикатор уровня: врезанная панель, стеклянная трубка, засечки, окна пика и перегруза */
-    cv_rrect_grad(c, 896, 46, 56, 306, 5, RGBA8(200, 194, 176, 255), RGBA8(186, 179, 160, 255));
-    cv_rrect_stroke(c, 896, 46, 56, 306, 5, 1.0f, K_EDGE);
+    if (!have_body) {
+        cv_rrect_grad(c, 896, 46, 56, 306, 5, RGBA8(200, 194, 176, 255), RGBA8(186, 179, 160, 255));
+        cv_rrect_stroke(c, 896, 46, 56, 306, 5, 1.0f, K_EDGE);
+    }
     cv_rrect(c, 899, 49, 50, 20, 3, RGBA8(24, 15, 10, 255));              /* окно CLIP */
     cv_rrect_stroke(c, 899, 49, 50, 20, 3, 1.0f, RGBA8(10, 6, 4, 255));
     cv_rrect(c, 899, 318, 50, 26, 3, RGBA8(24, 15, 10, 255));             /* окно пика */
@@ -2544,13 +2551,15 @@ static void skin_render_static(Canvas *c) {
         }
     }
 
-    /* панель управления */
-    cv_shadow(c, PN_X, PN_Y, PN_W, PN_H, 4, 2);
-    cv_rrect_grad(c, PN_X, PN_Y, PN_W, PN_H, 4, RGBA8(214, 208, 190, 255), RGBA8(196, 189, 170, 255));
-    cv_rrect_stroke(c, PN_X, PN_Y, PN_W, PN_H, 4, 1.0f, K_EDGE);
-    cv_rect(c, PN_X + 2, PN_Y + 1, PN_W - 4, 1, RGBA8(255, 255, 255, 130));
-    cv_rect(c, 292, 376, 1, 146, RGBA8(150, 142, 120, 255));
-    cv_rect(c, 293, 376, 1, 146, RGBA8(255, 255, 255, 140));
+    /* панель управления (при наличии body.png она уже нарисована в фоне) */
+    if (!have_body) {
+        cv_shadow(c, PN_X, PN_Y, PN_W, PN_H, 4, 2);
+        cv_rrect_grad(c, PN_X, PN_Y, PN_W, PN_H, 4, RGBA8(214, 208, 190, 255), RGBA8(196, 189, 170, 255));
+        cv_rrect_stroke(c, PN_X, PN_Y, PN_W, PN_H, 4, 1.0f, K_EDGE);
+        cv_rect(c, PN_X + 2, PN_Y + 1, PN_W - 4, 1, RGBA8(255, 255, 255, 130));
+        cv_rect(c, 292, 376, 1, 146, RGBA8(150, 142, 120, 255));
+        cv_rect(c, 293, 376, 1, 146, RGBA8(255, 255, 255, 140));
+    }
 }
 
 /* стекло перед ЭЛТ: строки развёртки, затемнение к краям, оранжевый оттенок, блик */
@@ -3209,7 +3218,7 @@ static void ui_draw(const UiState *u) {
         for (int k = 0; k <= METER_TICKS; k += 2) {
             char nb[8];
             snprintf(nb, sizeof(nb), "%d", k * (METER_DB / METER_TICKS));
-            text_r(METER_X - 9, METER_Y + k * (METER_H - 1) / METER_TICKS + 4, K_BROWN, 0.5f, nb);
+            text_r(METER_X - 9, METER_Y + k * (METER_H - 1) / METER_TICKS + 3, K_BROWN, 0.42f, nb);
         }
         for (int k = 0; k <= METER_TICKS; k++) {                       /* засечки каждые 3 дБ на краях трубки (поверх заливки) */
             int yy = METER_Y + k * (METER_H - 1) / METER_TICKS, tl = (k % 2 == 0) ? 5 : 3;

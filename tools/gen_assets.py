@@ -257,9 +257,81 @@ def make_lamps():
     Image.fromarray(sheet, "RGBA").save(os.path.join(OUT, "lamps.png"), optimize=True)
 
 
+
+
+# ---------------------------------------------------------------- корпус 960x544 (фон + врезанные панели + винты)
+def make_body():
+    W, H = 960, 544
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    px, py = xx + 0.5, yy + 0.5
+    rng = np.random.default_rng(11)
+    base = lerp((238, 234, 222), (221, 216, 202), py / H)
+    base = base * np.ones((H, W, 1), np.float32)
+    # верхняя планка чуть светлее
+    base = base + (py < 40)[..., None] * 3.0
+    # мягкая виньетка по краям корпуса
+    vx = np.abs(px - W / 2) / (W / 2)
+    vy = np.abs(py - H / 2) / (H / 2)
+    base = base - 7.0 * (np.clip(np.maximum(vx, vy) - 0.78, 0, 1) / 0.22)[..., None] ** 1.5
+    # зерно пластика (мелкое, тёплое)
+    g = rng.normal(0, 1.2, (H, W)).astype(np.float32)
+    base = base + g[..., None] * np.array([1.0, 1.0, 0.9], np.float32)
+    img = np.concatenate([base, np.full((H, W, 1), 255, np.float32)], -1)
+
+    def cov(d):
+        return np.clip(0.5 - d, 0, 1)
+
+    def blend(rgb, a):
+        a = np.clip(a, 0, 1)[..., None]
+        img[..., :3] = img[..., :3] * (1 - a) + np.asarray(rgb, np.float32) * a
+
+    def inset_panel(x0, y0, w, h, r, top_c, bot_c):
+        # светлая кромка снизу-справа, тёмная сверху-слева: панель врезана в корпус
+        blend((255, 255, 255), 0.65 * cov(rrect_sd(px, py, x0, y0 + 1.2, w, h, r)))
+        blend((110, 102, 84), 0.55 * cov(rrect_sd(px, py, x0 - 0.6, y0 - 0.9, w + 1.2, h, r)))
+        sd = rrect_sd(px, py, x0, y0, w, h, r)
+        t = np.clip((py - y0) / h, 0, 1)
+        face = lerp(top_c, bot_c, t)
+        face = face + rng.normal(0, 0.9, (H, W)).astype(np.float32)[..., None]
+        blend(face, cov(sd))
+        # внутренняя тень от верхнего и левого края
+        inner = -sd
+        blend((60, 52, 36), 0.26 * np.clip(1 - (py - y0) / 7.0, 0, 1) ** 1.6 * cov(sd))
+        blend((60, 52, 36), 0.14 * np.clip(1 - (px - x0) / 4.0, 0, 1) ** 1.6 * cov(sd))
+        blend((255, 255, 255), 0.30 * np.clip(1 - (y0 + h - py) / 2.5, 0, 1) ** 1.5 * cov(sd))
+        blend((120, 112, 90), 0.9 * cov(np.abs(sd) - 0.5))
+
+    inset_panel(10, 362, 938, 174, 6, (216, 210, 192), (198, 191, 172))
+    inset_panel(896, 46, 56, 306, 6, (204, 198, 180), (190, 183, 164))
+
+    # разделитель на панели управления
+    blend((150, 142, 120), (np.abs(px - 292.5) < 0.5) * (py > 376) * (py < 522) * 1.0)
+    blend((255, 255, 255), 0.55 * (np.abs(px - 293.5) < 0.5) * (py > 376) * (py < 522))
+
+    def screw(cx, cy, r=5.0, ang=0.4):
+        d = np.hypot(px - cx, py - cy)
+        blend((0, 0, 0), 0.22 * np.clip(1 - np.hypot(px - cx, py - cy - 1.0) / (r + 1.6), 0, 1))
+        light = np.clip(0.5 - 0.5 * ((px - cx) * 0.6 + (py - cy) * 0.8) / r, 0, 1)
+        head = lerp((120, 118, 112), (232, 230, 222), light)
+        blend(head, cov(d - r))
+        blend((70, 66, 58), 0.9 * cov(np.abs(d - r) - 0.55))
+        for a in (ang, ang + np.pi / 2):                           # крестовой шлиц
+            ux, uy = np.cos(a), np.sin(a)
+            along = (px - cx) * ux + (py - cy) * uy
+            across = -(px - cx) * uy + (py - cy) * ux
+            blend((50, 46, 40), 0.85 * cov(np.abs(across) - 0.7) * (np.abs(along) < r * 0.62) * cov(d - r + 0.8))
+
+    for cx, cy in ((24, 375), (934, 375), (24, 523), (934, 523)):
+        screw(cx, cy, 4.6, 0.35 + (cx * 7 + cy) % 5 * 0.4)
+
+    out = np.clip(img + 0.5, 0, 255).astype(np.uint8)
+    Image.fromarray(out, "RGBA").save(os.path.join(OUT, "body.png"), optimize=True)
+
+
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     make_knobs()
     make_keys()
     make_lamps()
+    make_body()
     print("ok")
