@@ -1958,13 +1958,13 @@ static void cv_blit_rot(Canvas *c, const Img *im, int sx, int sy, int sz, int cx
             cv_put(c, cx - (int)h + x, cy - (int)h + y, col, alpha);
         }
 }
-/* 9-slice: спрайт sz×sz, угол m; приёмник dw×dh */
+/* 9-slice: спрайт sz×sz, угол m; середина растягивается (ближайший пиксель); приёмник dw×dh */
 static void cv_blit9(Canvas *c, const Img *im, int sx, int sy, int sz, int m, int dx, int dy, int dw, int dh) {
-    int mid = sz - 2 * m;
+    int mid = sz - 2 * m, dmx = dw - 2 * m, dmy = dh - 2 * m;
     for (int y = 0; y < dh; y++) {
-        int ty = y < m ? y : (y >= dh - m ? sz - (dh - y) : m + (y - m) % mid);
+        int ty = y < m ? y : (y >= dh - m ? sz - (dh - y) : m + (y - m) * mid / dmy);
         for (int x = 0; x < dw; x++) {
-            int tx = x < m ? x : (x >= dw - m ? sz - (dw - x) : m + (x - m) % mid);
+            int tx = x < m ? x : (x >= dw - m ? sz - (dw - x) : m + (x - m) * mid / dmx);
             cv_put(c, dx + x, dy + y, im->px[(sy + ty) * im->w + sx + tx], 1.0f);
         }
     }
@@ -2128,7 +2128,7 @@ static void cv_icon(Canvas *c, int kind, float cx, float cy, uint32_t col) {
 static void cv_key(Canvas *c, int x, int y, int w, int h, int style, int pressed) {
     if (g_img_keys.px && style != 2) {
         int col = style == 1 ? 1 : (style == 3 ? 2 : (style == 4 ? 3 : 0));
-        cv_blit9(c, &g_img_keys, col * 52, pressed ? 52 : 0, 52, 16, x - 8, y - 5, w + 16, h + 16);
+        cv_blit9(c, &g_img_keys, col * 52, pressed ? 52 : 0, 52, 20, x - 8, y - 5, w + 16, h + 16);
         return;
     }
     uint32_t top, bot, edge, side;
