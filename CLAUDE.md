@@ -56,3 +56,10 @@
 - Позже: PNG-скины (гибрид), запись в пады / секвенсор, уточнение нарезки по сетке BPM, стерео-индикатор (если появится стерео).
 - MIDI: плагин `psvita-usb-audio-midi` делает Vita USB-устройством (MIDI приходит от компьютера/хоста); USB-хоста на Vita
   1000/2000, по найденным данным, нет — клавиатура напрямую не подключается. См. репозиторий VitaMIDI.
+
+## PNG-скины (гибрид)
+
+- `tools/gen_assets.py` (numpy+PIL) рисует `assets/knobs.png`, `keys.png`, `lamps.png`; в VPK они лежат как `assets/*.png`
+  (FILE-записи в CMakeLists). В `main.c`: `assets_init` (libpng simplified API), `cv_blit/cv_blit_rot/cv_blit9`;
+  `cv_knob/cv_key/cv_lamp` используют спрайты, а если файла нет — старая процедурная отрисовка. Красная клавиша (стиль 2) пока процедурная.
+- Хост: `ASSET_PREFIX="../assets/"` в `host/Makefile`. Следующие этапы: фон/корпус/панель, цифры, трубка уровня.
