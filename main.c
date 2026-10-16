@@ -24,6 +24,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/io/fcntl.h>
 #include <vita2d.h>
+#include <png.h>
 
 unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 
@@ -1874,6 +1875,34 @@ static void fx_text(char *out, size_t cap, int param, int idx) {
 
 typedef struct { uint32_t *px; int w, h; } Canvas;
 
+/* ---------- PNG-спрайты (ручки, клавиши, лампочки); если файла нет — рисуем процедурно ---------- */
+#ifndef ASSET_PREFIX
+#define ASSET_PREFIX "app0:assets/"
+#endif
+typedef struct { uint32_t *px; int w, h; } Img;
+static Img g_img_knobs, g_img_keys, g_img_lamps;
+
+static int img_load(Img *im, const char *name) {
+    char path[256];
+    snprintf(path, sizeof path, "%s%s", ASSET_PREFIX, name);
+    png_image pi;
+    memset(&pi, 0, sizeof pi);
+    pi.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_file(&pi, path)) return 0;
+    pi.format = PNG_FORMAT_RGBA;
+    size_t sz = PNG_IMAGE_SIZE(pi);
+    uint32_t *buf = (uint32_t *)malloc(sz);
+    if (!buf) { png_image_free(&pi); return 0; }
+    if (!png_image_finish_read(&pi, NULL, buf, 0, NULL)) { free(buf); png_image_free(&pi); return 0; }
+    im->px = buf; im->w = (int)pi.width; im->h = (int)pi.height;
+    return 1;
+}
+static void assets_init(void) {
+    img_load(&g_img_knobs, "knobs.png");
+    img_load(&g_img_keys, "keys.png");
+    img_load(&g_img_lamps, "lamps.png");
+}
+
 static inline float fclampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static inline uint32_t lerp_col(uint32_t a, uint32_t b, float t) {
     int ar = a & 255, ag = (a >> 8) & 255, ab = (a >> 16) & 255, aa = a >> 24;
@@ -1897,6 +1926,48 @@ static inline void cv_put(Canvas *c, int x, int y, uint32_t src, float cov) {
     float g = ((float)((src >> 8) & 255) * sa + (float)((dv >> 8) & 255) * k) / oa;
     float b = ((float)((src >> 16) & 255) * sa + (float)((dv >> 16) & 255) * k) / oa;
     *d = RGBA8((int)(r + 0.5f), (int)(g + 0.5f), (int)(b + 0.5f), (int)(oa * 255.0f + 0.5f));
+}
+
+/* копия прямоугольника спрайта (alpha-смешивание) */
+static void cv_blit(Canvas *c, const Img *im, int sx, int sy, int sw, int sh, int dx, int dy, float alpha) {
+    for (int y = 0; y < sh; y++)
+        for (int x = 0; x < sw; x++)
+            cv_put(c, dx + x, dy + y, im->px[(sy + y) * im->w + sx + x], alpha);
+}
+/* спрайт с поворотом вокруг центра (билинейно), угол a в радианах по часовой от «вверх» */
+static void cv_blit_rot(Canvas *c, const Img *im, int sx, int sy, int sz, int cx, int cy, float a, float alpha) {
+    float sn = sinf(a), cs = cosf(a), h = sz * 0.5f;
+    for (int y = 0; y < sz; y++)
+        for (int x = 0; x < sz; x++) {
+            float px = x + 0.5f - h, py = y + 0.5f - h;           /* точка назначения от центра */
+            float u = px * cs + py * sn + h - 0.5f, v = -px * sn + py * cs + h - 0.5f;
+            int u0 = (int)floorf(u), v0 = (int)floorf(v);
+            float fu = u - u0, fv = v - v0, acc[4] = { 0, 0, 0, 0 };
+            for (int k = 0; k < 4; k++) {
+                int xx = u0 + (k & 1), yy = v0 + (k >> 1);
+                float wgt = ((k & 1) ? fu : 1 - fu) * ((k >> 1) ? fv : 1 - fv);
+                if (xx < 0 || yy < 0 || xx >= sz || yy >= sz) continue;
+                uint32_t p = im->px[(sy + yy) * im->w + sx + xx];
+                float pa = (float)(p >> 24) * wgt;
+                acc[0] += (float)(p & 255) * pa; acc[1] += (float)((p >> 8) & 255) * pa;
+                acc[2] += (float)((p >> 16) & 255) * pa; acc[3] += pa;
+            }
+            if (acc[3] <= 0.5f) continue;
+            uint32_t col = RGBA8((int)(acc[0] / acc[3] + 0.5f), (int)(acc[1] / acc[3] + 0.5f),
+                                 (int)(acc[2] / acc[3] + 0.5f), (int)(acc[3] + 0.5f));
+            cv_put(c, cx - (int)h + x, cy - (int)h + y, col, alpha);
+        }
+}
+/* 9-slice: спрайт sz×sz, угол m; приёмник dw×dh */
+static void cv_blit9(Canvas *c, const Img *im, int sx, int sy, int sz, int m, int dx, int dy, int dw, int dh) {
+    int mid = sz - 2 * m;
+    for (int y = 0; y < dh; y++) {
+        int ty = y < m ? y : (y >= dh - m ? sz - (dh - y) : m + (y - m) % mid);
+        for (int x = 0; x < dw; x++) {
+            int tx = x < m ? x : (x >= dw - m ? sz - (dw - x) : m + (x - m) % mid);
+            cv_put(c, dx + x, dy + y, im->px[(sy + ty) * im->w + sx + tx], 1.0f);
+        }
+    }
 }
 
 static void cv_clear(Canvas *c, uint32_t col) {
@@ -2055,6 +2126,11 @@ static void cv_icon(Canvas *c, int kind, float cx, float cy, uint32_t col) {
 
 /* ---------- квадратные клавиши: 0 кремовая, 1 оранжевая, 2 красная, 3 зелёная, 4 серая ---------- */
 static void cv_key(Canvas *c, int x, int y, int w, int h, int style, int pressed) {
+    if (g_img_keys.px && style != 2) {
+        int col = style == 1 ? 1 : (style == 3 ? 2 : (style == 4 ? 3 : 0));
+        cv_blit9(c, &g_img_keys, col * 52, pressed ? 52 : 0, 52, 16, x - 8, y - 5, w + 16, h + 16);
+        return;
+    }
     uint32_t top, bot, edge, side;
     switch (style) {
     case 1:  top = K_ORANGE_HI; bot = K_ORANGE; edge = K_ORANGE_LO; side = RGBA8(150, 58, 12, 255); break;
@@ -2083,6 +2159,17 @@ static void cv_line(Canvas *c, float x0, float y0, float x1, float y1, float r, 
 
 /* ручка: v 0..1, стрелка и точки шкалы; управляется только касанием экрана */
 static void cv_knob(Canvas *c, int cx, int cy, int r, float v, int active, int dim) {
+    int ri = r <= 20 ? 0 : (r <= 26 ? 1 : (r <= 28 ? 2 : 3));
+    if (g_img_knobs.px && g_img_knobs.h >= 4 * 88) {
+        cv_blit(c, &g_img_knobs, active ? 88 : 0, ri * 88, 88, 88, cx - 44, cy - 44, 1.0f);
+        cv_blit_rot(c, &g_img_knobs, 176, ri * 88, 88, cx, cy, (-135.0f + 270.0f * v) * 3.14159265f / 180.0f, dim ? 0.5f : 1.0f);
+        for (int k = 0; k < 11; k++) {
+            float t = (float)k / 10.0f, b = (-135.0f + 270.0f * t) * 3.14159265f / 180.0f;
+            int lit = t <= v + 1e-4f && !dim;
+            cv_circle(c, cx + sinf(b) * (r + 10.0f), cy - cosf(b) * (r + 10.0f), lit ? 1.9f : 1.3f, lit ? K_ORANGE : RGBA8(150, 138, 112, 255));
+        }
+        return;
+    }
     cv_shadow(c, (float)(cx - r - 3), (float)(cy - r - 3), (float)(2 * r + 6), (float)(2 * r + 6), (float)(r + 3), 3.0f);
     cv_circle(c, (float)cx, (float)cy, (float)r + 3.0f, active ? K_ORANGE : RGBA8(120, 112, 94, 255));
     cv_circle(c, (float)cx, (float)cy, (float)r + 1.5f, RGBA8(120, 112, 94, 255));
@@ -2105,6 +2192,11 @@ static void cv_knob(Canvas *c, int cx, int cy, int r, float v, int active, int d
 
 /* лампочка: цветной ободок, стеклянный купол, блик и ореол (по образцам: маленькая круглая линза) */
 static void cv_lamp(Canvas *c, int cx, int cy, int r, uint32_t col, int on) {
+    if (g_img_lamps.px) {
+        int ci = (col & 255) > 200 && ((col >> 8) & 255) < 100 ? 0 : (((col >> 8) & 255) > 200 ? 1 : 2);
+        cv_blit(c, &g_img_lamps, (ci * 2 + (on ? 1 : 0)) * 40, 0, 40, 40, cx - 20, cy - 20, 1.0f);
+        return;
+    }
     cv_circle(c, (float)cx, (float)cy + 1.2f, (float)r + 3.0f, RGBA8(0, 0, 0, 46));               /* тень */
     cv_circle(c, (float)cx, (float)cy, (float)r + 2.6f, RGBA8(52, 40, 32, 255));                  /* тёмная оправа */
     cv_circle(c, (float)cx, (float)cy, (float)r + 1.7f, lerp_col(col, RGBA8(60, 48, 38, 255), on ? 0.0f : 0.45f));   /* цветной ободок */
@@ -2486,7 +2578,7 @@ static void cv_clear_rect(Canvas *c, int x, int y, int w, int h) {
         for (int i = x; i < x + w; i++) if (i >= 0 && i < c->w) c->px[j * c->w + i] = 0;
     }
 }
-static void cv_clear_part(Canvas *c, int x, int y, int w, int h) { cv_clear_rect(c, x - 6, y - 6, w + 12, h + 12); }
+static void cv_clear_part(Canvas *c, int x, int y, int w, int h) { cv_clear_rect(c, x - 6, y - 3, w + 12, h + 10); }
 
 enum { IC_GRAIN = 20, IC_DEL, IC_SIL, IC_DUP, IC_GAP };
 static void cv_icon_ex(Canvas *c, int kind, float cx, float cy, uint32_t col) {
@@ -2737,6 +2829,7 @@ static void ui_create_textures(void) {
 
 static int ui_init(void) {
     knobs_init();
+    assets_init();
     g_cv_bg.w = SCR_W; g_cv_bg.h = SCR_H; g_cv_bg.px = (uint32_t *)malloc((size_t)SCR_W * SCR_H * 4);
     g_cv_top.w = SCR_W; g_cv_top.h = TOP_H; g_cv_top.px = (uint32_t *)malloc((size_t)SCR_W * TOP_H * 4);
     g_cv_glass.w = CRT_W; g_cv_glass.h = CRT_H; g_cv_glass.px = (uint32_t *)calloc((size_t)CRT_W * CRT_H, 4);
