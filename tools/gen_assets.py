@@ -67,6 +67,7 @@ KBOX = 88            # клетка спрайта ручки: центр в (44
 
 
 def knob_body(R, active):
+    """Ручка как у осциллографа С1-65: чёрный рифлёный пластик, плоская верхушка с проточками, хромовая юбка."""
     S = KBOX
     img = new(S, S)
     x, y = grid(S, S)
@@ -74,48 +75,50 @@ def knob_body(R, active):
     y -= S / 2
     r = np.hypot(x, y)
     th = np.arctan2(y, x)
-    # тень
-    d = np.hypot(x, y - 3.0)
-    over(img, np.full(img.shape[:2] + (3,), (60, 42, 24), np.float32), 0.34 * np.clip((R + 4.8 - d) / 7.0, 0, 1) ** 1.6)
-    # ободок: литое кольцо, свет сверху-слева
-    light = 0.5 + 0.5 * np.cos(th + 2.356)
-    if active:
-        rim = lerp((150, 54, 14), (252, 168, 84), light)
-    else:
-        rim = lerp((84, 78, 64), (240, 236, 224), light ** 1.2)
-    over(img, rim, cover(r - (R + 3.3)))
-    over(img, np.full(img.shape[:2] + (3,), (64, 56, 44), np.float32), 0.85 * cover(np.abs(r - (R + 0.1)) - 0.45))   # тёмный зазор
-    # колпачок: радиальный градиент + «шлифованный металл»
-    u = (x + 0.30 * R) / R
-    v = (y + 0.36 * R) / R
-    t = np.clip(np.hypot(u, v) / 1.35, 0, 1)
-    cap = lerp((254, 251, 240), (172, 166, 150), t ** 1.15)
-    spin = np.maximum(0, np.cos(2 * (th + 0.75))) ** 7
-    cap = cap + 22 * spin[..., None] * smooth(0.12 * R, 0.5 * R, r)[..., None] - 10 * (np.maximum(0, np.cos(2 * (th - 0.8))) ** 9)[..., None] * smooth(0.2 * R, R, r)[..., None]
-    cap = cap + 3.0 * np.sin(r * 6.5)[..., None]
-    over(img, cap, cover(r - (R - 0.2)))
-    # канавка на колпачке и светлая кромка под ней
-    over(img, np.full(img.shape[:2] + (3,), (90, 80, 62), np.float32), 0.32 * cover(np.abs(r - 0.58 * R) - 0.5))
-    over(img, np.full(img.shape[:2] + (3,), (255, 255, 255), np.float32), 0.45 * cover(np.abs(r - 0.58 * R - 0.9) - 0.4) * (light > 0.35))
-    # тонкая внешняя кромка колпачка
-    over(img, np.full(img.shape[:2] + (3,), (104, 96, 78), np.float32), 0.7 * cover(np.abs(r - (R - 0.3)) - 0.55))
+    C = lambda c: np.full(img.shape[:2] + (3,), c, np.float32)
+    d = np.hypot(x, y - 3.0)                                                       # тень на панели
+    over(img, C((60, 42, 24)), 0.36 * np.clip((R + 4.8 - d) / 7.0, 0, 1) ** 1.6)
+    light = 0.5 + 0.5 * np.cos(th + 2.356)                                         # свет сверху-слева
+    if active:                                                                     # юбка: оранжевая при касании
+        skirt = lerp((150, 54, 14), (252, 168, 84), light)
+    else:                                                                          # юбка: хром
+        skirt = lerp((92, 92, 94), (236, 238, 240), light ** 1.3)
+    over(img, skirt, cover(r - (R + 3.4)))
+    over(img, C((20, 20, 22)), 0.9 * cover(np.abs(r - (R + 0.6)) - 0.5))           # зазор между юбкой и ручкой
+    # боковая рифлёная стенка: рёбра по окружности
+    Rb = R + 0.1
+    ribs = 0.5 + 0.5 * np.cos(th * 30)
+    wall = lerp((20, 20, 22), (70, 70, 74), ribs * (0.35 + 0.65 * light))
+    over(img, wall, cover(r - Rb))
+    # верхняя площадка: тёмный пластик, радиальный градиент от блика
+    rt = Rb - 3.6
+    u, v = (x + 0.28 * R) / R, (y + 0.34 * R) / R
+    t = np.clip(np.hypot(u, v) / 1.3, 0, 1)
+    top = lerp((74, 74, 80), (22, 22, 24), t ** 0.9)
+    top = top + 3.0 * np.sin(r * 9.0)[..., None] * smooth(0.2 * R, 0.5 * R, r)[..., None]   # токарные проточки
+    over(img, top, cover(r - rt))
+    over(img, C((8, 8, 10)), 0.7 * cover(np.abs(r - rt) - 0.5))                    # фаска площадки
+    over(img, C((150, 150, 156)), 0.45 * cover(np.abs(r - rt + 0.9) - 0.4) * (light > 0.5))
+    over(img, C((6, 6, 8)), 0.55 * cover(np.abs(r - 0.52 * R) - 0.5))               # центральная проточка
+    over(img, C((120, 120, 126)), 0.30 * cover(np.abs(r - 0.52 * R - 0.9) - 0.4) * (light > 0.4))
     # блик
-    hl = np.hypot(x + 0.36 * R, y + 0.44 * R)
-    over(img, np.full(img.shape[:2] + (3,), (255, 255, 255), np.float32), 0.30 * np.clip(1 - hl / (0.42 * R), 0, 1) ** 1.5)
+    hl = np.hypot(x + 0.34 * R, y + 0.42 * R)
+    over(img, C((255, 255, 255)), 0.20 * np.clip(1 - hl / (0.46 * R), 0, 1) ** 1.6)
     return down(img)
 
 
 def knob_pointer(R):
+    """Белая риска-указатель (рисуется поворотом вокруг центра)."""
     S = KBOX
     img = new(S, S)
     x, y = grid(S, S)
     x -= S / 2
     y -= S / 2
-    w, y0, y1 = 3.4, -0.88 * R, -0.30 * R
-    sd = rrect_sd(x, y, -w / 2, y0, w, y1 - y0, w / 2)
-    over(img, np.full(img.shape[:2] + (3,), (255, 255, 255), np.float32), 0.55 * cover(rrect_sd(x - 0.7, y - 1.1, -w / 2, y0, w, y1 - y0, w / 2)))   # светлая «подсветка» снизу-справа
-    body = lerp((96, 76, 60), (62, 46, 36), (x + w / 2) / w)
-    over(img, body, cover(sd))
+    w, y0, y1 = 3.2, -0.90 * R, -0.20 * R
+    sdr = lambda dx, dy: rrect_sd(x - dx, y - dy, -w / 2, y0, w, y1 - y0, w / 2)
+    over(img, np.zeros(img.shape[:2] + (3,), np.float32), 0.45 * cover(sdr(0.5, 0.8)))      # тень риски
+    over(img, np.full(img.shape[:2] + (3,), (246, 244, 236), np.float32), cover(sdr(0, 0)))
+    over(img, np.full(img.shape[:2] + (3,), (170, 166, 154), np.float32), 0.6 * cover(rrect_sd(x, y, w / 2 - 0.2, y0, 0.9, y1 - y0, 0.4)))
     return down(img)
 
 
@@ -139,32 +142,41 @@ KEY_STYLES = {
 
 
 def key_sprite(style, pressed):
+    """Клавиша как у калькуляторов 70-х: скошенные стенки, слегка вогнутая верхняя грань, чёрное гнездо."""
     top, bot, edge, side = KEY_STYLES[style]
     img = new(KS, KS)
     x, y = grid(KS, KS)
-    bx, by, bw, bh = 8.0, 5.0 + (2.0 if pressed else 0.0), 36.0, 36.0
-    sdb = rrect_sd(x, y, bx, by, bw, bh, 3.0)
-    # мягкая тень под клавишей
-    sds = rrect_sd(x, y, bx - 1, by + (2.5 if pressed else 4.5), bw + 2, bh, 4.0)
-    over(img, np.full(img.shape[:2] + (3,), (60, 42, 24), np.float32), (0.20 if pressed else 0.28) * np.clip(1 - sds / (4.0 if pressed else 6.0), 0, 1) ** 2 * (sds > -1))
-    if not pressed:
-        sdf = rrect_sd(x, y, bx, by + 3.0, bw, bh, 3.0)
-        over(img, np.full(img.shape[:2] + (3,), side, np.float32), cover(sdf))
-    g = np.clip((y - by) / bh, 0, 1)
+    C = lambda c: np.full(img.shape[:2] + (3,), c, np.float32)
+    dy_ = 2.0 if pressed else 0.0
+    bx, by, bw, bh = 8.0, 5.0 + dy_, 36.0, 36.0
+    # гнездо: тёмная тень вокруг клавиши
+    sds = rrect_sd(x, y, bx - 1.2, by - 0.6 + (1.6 if pressed else 2.6), bw + 2.4, bh + 1.0, 5.0)
+    over(img, C((20, 16, 12)), (0.34 if pressed else 0.30) * np.clip(1 - sds / 4.2, 0, 1) ** 1.8 * (sds > -1))
+    sdo = rrect_sd(x, y, bx, by, bw, bh, 4.5)                    # внешний контур (низ стенок)
+    if not pressed:                                              # нижняя грань: высота клавиши
+        over(img, C(side), cover(rrect_sd(x, y, bx, by + 3.0, bw, bh, 4.5)))
+        over(img, C(edge), 0.5 * cover(np.abs(rrect_sd(x, y, bx, by + 3.0, bw, bh, 4.5)) - 0.5))
+    # скошенные стенки: свет сверху-слева, тень снизу-справа
+    nx, ny = (x - (bx + bw / 2)) / (bw / 2), (y - (by + bh / 2)) / (bh / 2)
+    lt = np.clip(0.5 - 0.5 * (nx * 0.55 + ny * 0.85) / (np.abs(nx) + np.abs(ny) + 1e-3), 0, 1)
+    wall = lerp(lerp(top, (0, 0, 0), 0.22), lerp(top, (255, 255, 255), 0.55), lt)
+    over(img, wall, cover(sdo))
+    # верхняя грань: вогнутая (темнее в центре, светлее к кромке), вертикальный градиент
+    inset = 3.0
+    sdt = rrect_sd(x, y, bx + inset, by + inset, bw - 2 * inset, bh - 2 * inset, 3.0)
+    g = np.clip((y - (by + inset)) / (bh - 2 * inset), 0, 1)
     c0, c1 = (bot, top) if pressed else (top, bot)
     face = lerp(c0, c1, g)
-    over(img, face, cover(sdb))
-    # внутренняя фаска: светлая сверху-слева, тёмная снизу-справа
-    inner = -sdb
-    bev = np.where(y < by + bh * 0.5, 1.0, -1.0)
-    over(img, np.full(img.shape[:2] + (3,), 255.0, np.float32), (0.16 if not pressed else 0.05) * (bev > 0) * cover(np.abs(inner - 1.6) - 0.6) * (inner > 0.6))
-    over(img, np.zeros(img.shape[:2] + (3,), np.float32), (0.07) * (bev < 0) * cover(np.abs(inner - 1.6) - 0.6) * (inner > 0.6))
-    over(img, np.full(img.shape[:2] + (3,), edge, np.float32), cover(np.abs(sdb) - 0.5))
+    cc = np.clip(np.hypot(nx, ny) / 1.2, 0, 1)
+    face = face * (1 - 0.06 * (1 - cc))[..., None]               # лёгкая вогнутость
+    over(img, face, cover(sdt))
+    over(img, C(edge), 0.55 * cover(np.abs(sdt) - 0.45))         # шов между стенкой и верхом
+    over(img, C(edge), cover(np.abs(sdo) - 0.5))                 # внешний контур
     if not pressed:
-        over(img, np.full(img.shape[:2] + (3,), (255, 255, 255), np.float32), (0.36 if style == 0 else 0.30) * cover(rrect_sd(x, y, bx + 3, by + 1.0, bw - 6, 1.3, 0.6)))
+        over(img, C((255, 255, 255)), 0.34 * cover(rrect_sd(x, y, bx + 5, by + 1.0, bw - 10, 1.2, 0.6)))
     out = down(img)
-    rng = np.random.default_rng(7 + style * 3 + pressed)          # чуть-чуть зерна пластика
-    n = rng.normal(0, 1.4, out.shape[:2])[..., None]
+    rng = np.random.default_rng(7 + style * 3 + pressed)          # зерно пластика
+    n = rng.normal(0, 1.3, out.shape[:2])[..., None]
     out[..., :3] = np.clip(out[..., :3].astype(np.float32) + n * (out[..., 3:4] > 200), 0, 255).astype(np.uint8)
     return out
 
