@@ -21,6 +21,8 @@
 #include <psp2/audioout.h>
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
+#include <psp2/common_dialog.h>
+#include <psp2/ime_dialog.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/fcntl.h>
 #include <vita2d.h>
@@ -1020,7 +1022,7 @@ static int write_wav_file(const char *path, const int16_t *d, int n) {
     return 0;
 }
 
-static int save_wav(char *path, size_t path_cap) {
+static int save_wav(char *path, size_t path_cap, const char *name) {
     int len = g_length;
     if (len <= 0) return -1;
 
@@ -1028,7 +1030,19 @@ static int save_wav(char *path, size_t path_cap) {
 
     /* звук не менялся с прошлой выгрузки - перезаписываем тот же файл, а не плодим копии */
     g_wav_overwrote = 0;
-    if (g_wav_path[0] && g_wav_ver == g_audio_ver) {
+    if (name && name[0]) {
+        /* имя выбрано в диалоге: тот же файл (тот же звук) перезаписываем, чужой с таким именем - не трогаем, добавляем _2, _3... */
+        snprintf(path, path_cap, "ux0:data/Sampler/%s.wav", name);
+        if (g_wav_path[0] && g_wav_ver == g_audio_ver && strcmp(path, g_wav_path) == 0) g_wav_overwrote = 1;
+        else {
+            for (int i = 2; i < 1000; i++) {
+                FILE *t = fopen(path, "rb");
+                if (!t) break;
+                fclose(t);
+                snprintf(path, path_cap, "ux0:data/Sampler/%s_%d.wav", name, i);
+            }
+        }
+    } else if (g_wav_path[0] && g_wav_ver == g_audio_ver) {
         snprintf(path, path_cap, "%s", g_wav_path);
         g_wav_overwrote = 1;
     } else {
@@ -3837,10 +3851,102 @@ static int export_slices(void) {
     return ok;
 }
 
+/* ---------- ввод имени файла: системная экранная клавиатура ---------- */
+static void u8to16(const char *s, uint16_t *d, int max) {
+    const unsigned char *p = (const unsigned char *)s;
+    int n = 0;
+    while (*p && n < max - 2) {
+        unsigned c;
+        if (*p < 0x80) c = *p++;
+        else if ((*p & 0xE0) == 0xC0 && p[1]) { c = ((p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu); p += 2; }
+        else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) { c = ((p[0] & 0x0Fu) << 12) | ((p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu); p += 3; }
+        else { p++; continue; }
+        d[n++] = (uint16_t)c;
+    }
+    d[n] = 0;
+}
+static void u16to8(const uint16_t *s, char *d, int max) {
+    int n = 0;
+    while (*s && n < max - 4) {
+        unsigned c = *s++;
+        if (c < 0x80) d[n++] = (char)c;
+        else if (c < 0x800) { d[n++] = (char)(0xC0 | (c >> 6)); d[n++] = (char)(0x80 | (c & 0x3F)); }
+        else { d[n++] = (char)(0xE0 | (c >> 12)); d[n++] = (char)(0x80 | ((c >> 6) & 0x3F)); d[n++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    d[n] = 0;
+}
+/* убираем символы, запрещённые в именах файлов, и пробелы по краям */
+static void name_clean(char *s) {
+    for (char *p = s; *p; p++)
+        if (*p == '/' || *p == '\\' || *p == ':' || *p == '*' || *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|' || (unsigned char)*p < 32) *p = '_';
+    char *a = s;
+    while (*a == ' ' || *a == '.') a++;
+    memmove(s, a, strlen(a) + 1);
+    int n = (int)strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '.')) s[--n] = 0;
+}
+/* 1 - имя введено (в out), 0 - отмена */
+static int ime_name(const char *init, char *out, int cap) {
+    static uint16_t title[] = { 'F', 'i', 'l', 'e', ' ', 'n', 'a', 'm', 'e', 0 };
+    static uint16_t ini[SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1], buf[SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1];
+    u8to16(init, ini, 48);
+    memset(buf, 0, sizeof buf);
+    SceImeDialogParam p;
+    sceImeDialogParamInit(&p);
+    p.supportedLanguages = 0;
+    p.languagesForced = 0;
+    p.type = SCE_IME_TYPE_DEFAULT;
+    p.option = 0;
+    p.title = title;
+    p.maxTextLength = 40;
+    p.initialText = ini;
+    p.inputTextBuffer = buf;
+    if (sceImeDialogInit(&p) < 0) return 0;
+    while (sceImeDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) {
+        vita2d_start_drawing();
+        vita2d_clear_screen();
+        vita2d_end_drawing();
+        vita2d_common_dialog_update();
+        vita2d_swap_buffers();
+    }
+    SceImeDialogResult r;
+    memset(&r, 0, sizeof r);
+    sceImeDialogGetResult(&r);
+    int ok = (r.button == SCE_IME_DIALOG_BUTTON_ENTER);
+    sceImeDialogTerm();
+    if (!ok) return 0;
+    u16to8(buf, out, cap);
+    name_clean(out);
+    return out[0] != 0;
+}
+
+/* имя по умолчанию: то, под которым этот звук уже сохранён, иначе первое свободное rec_NNN */
+static void default_save_name(char *out, size_t cap) {
+    if (g_wav_path[0] && g_wav_ver == g_audio_ver) {
+        const char *b = strrchr(g_wav_path, '/');
+        snprintf(out, cap, "%s", b ? b + 1 : g_wav_path);
+        size_t n = strlen(out);
+        if (n > 4 && strcmp(out + n - 4, ".wav") == 0) out[n - 4] = 0;
+        return;
+    }
+    for (int i = 1; i < 1000; i++) {
+        char t[128];
+        snprintf(t, sizeof t, "ux0:data/Sampler/rec_%03d.wav", i);
+        FILE *f = fopen(t, "rb");
+        if (!f) { snprintf(out, cap, "rec_%03d", i); return; }
+        fclose(f);
+    }
+    snprintf(out, cap, "rec");
+}
+
 static void act_save(void) {
     if (g_state == ST_RECORDING) return;
-    char path[128];
-    int r = save_wav(path, sizeof(path));
+    if (g_length <= 0) { snprintf(msg, sizeof(msg), "Nothing to save - record something first"); return; }
+    char nm[96], init[96];
+    default_save_name(init, sizeof init);
+    if (!ime_name(init, nm, sizeof nm)) { snprintf(msg, sizeof(msg), "Save cancelled"); return; }
+    char path[160];
+    int r = save_wav(path, sizeof(path), nm);
     if (r == 0) {
         snprintf(msg, sizeof(msg), g_wav_overwrote ? "Saved (same file updated): %s" : "Saved: %s", path);
         if (g_mode == 1) {

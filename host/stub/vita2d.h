@@ -14,6 +14,7 @@ void vita2d_set_clear_color(unsigned int color);
 void vita2d_start_drawing(void);
 void vita2d_end_drawing(void);
 void vita2d_swap_buffers(void);
+void vita2d_common_dialog_update(void);
 void vita2d_wait_rendering_done(void);
 vita2d_texture *vita2d_create_empty_texture(unsigned int w, unsigned int h);
 void vita2d_free_texture(vita2d_texture *texture);
