@@ -94,6 +94,8 @@ int main(int argc, char **argv) {
     const char *outp = argc > 1 ? argv[1] : "/tmp/frame.raw";
     int page = argc > 2 ? atoi(argv[2]) : 0, mode = argc > 3 ? atoi(argv[3]) : 0;
     int fxsec = argc > 4 ? atoi(argv[4]) : 0, legend = argc > 5 ? atoi(argv[5]) : 0, sc = argc > 6 ? atoi(argv[6]) : 0;   /* sc: 0 обычная, 1 пусто, 2 запись */
+    g_theme = argc > 7 ? atoi(argv[7]) : 0;                  /* тема: 0 Classic, 1 Aqua */
+    g_set_open = argc > 8 ? atoi(argv[8]) : 0;               /* 1 - экран настроек */
     g_fb = calloc((size_t)SCR_W * SCR_H, 4);
     FT_Init_FreeType(&g_ft);
     for (int i = 0; i < W_N; i++) g_hann[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * (float)i / (float)W_N));
@@ -134,7 +136,7 @@ int main(int argc, char **argv) {
         }
     }
     scene(&u, page, mode, ST_PLAYING);
-    u.fx_sec = fxsec; u.legend = legend;
+    u.fx_sec = fxsec; u.legend = legend; u.settings = g_set_open;
     if (mode == 1) { for (int i = 0; i <= 8; i++) g_sl_pos[i] = len * i / 8; g_sl_n = 8; u.sl_n = 8; }
     u.kb_note = (sc == 6) ? 16 : -1;                          /* sc 6: на клавиатуре GRAIN нажата клавиша E (+4 пт) */
     if (sc == 6) { g_kb_on = 1; g_kb_semi = 4; }

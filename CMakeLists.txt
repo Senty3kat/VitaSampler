@@ -53,4 +53,5 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   FILE ${CMAKE_SOURCE_DIR}/assets/keys.png assets/keys.png
   FILE ${CMAKE_SOURCE_DIR}/assets/lamps.png assets/lamps.png
   FILE ${CMAKE_SOURCE_DIR}/assets/body.png assets/body.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/t1_body.png assets/t1_body.png
 )
