@@ -854,6 +854,11 @@ static volatile unsigned g_pad_trig[PAD_N], g_pad_rel[PAD_N];
 static volatile int g_pad_mask;                    /* биты пэдов, у которых сейчас звучит голос (для индикации) */
 static unsigned g_pad_seen_t[PAD_N], g_pad_seen_r[PAD_N];
 
+/* Запас в сегменте кода: vita-elf-create дописывает в конец сегмента 0 таблицы импорта (~2.8 КБ); если код заканчивается
+ * почти у границы страницы, сборка падает с "Cannot allocate ... segment 1 overlaps". Тогда меняем TEXT_PAD (на 1-2 КБ). */
+#define TEXT_PAD 3000
+static void __attribute__((used, noinline)) text_pad(void) { __asm__ volatile(".space " "3000"); }
+
 static float pad_ms(int v) { float t = (float)v / 100.0f; return 3000.0f * t * t; }
 static void pad_defaults(Pad *p) { p->vol = 80; p->pitch = 24; p->start = 0; p->mode = 0; p->a = 0; p->dc = 30; p->s = 100; p->r = 10; p->cth = 100; p->crat = 40; p->cmk = 0; p->cmx = 100; }
 
