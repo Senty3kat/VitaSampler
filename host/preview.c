@@ -125,6 +125,7 @@ int main(int argc, char **argv) {
         }
         g_pad[0].a = 4; g_pad[0].dc = 40; g_pad[0].s = 55; g_pad[0].r = 25; g_pad[0].start = 12; g_pad[0].mode = 1;
         g_pu.sel = 0; g_pe_vol = 80; g_pe_pitch = 24; g_pe_start = 12;
+        g_pe_a = 4; g_pe_dc = 40; g_pe_s = 55; g_pe_r = 25; g_pad_env_sub = (sc == 4);
         g_pad_mask = 1 << 3; g_pu.down_mask = 1 << 1;
         if (sc == 3) {
             g_pu.list_open = 1; g_pu.list_n = 14; g_pu.list_sel = 3;

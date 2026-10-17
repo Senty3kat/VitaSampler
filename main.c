@@ -81,6 +81,19 @@ unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 #define GL_M 7                    /* поле вокруг экрана в текстуре стекла (литая кромка) */
 #define GL_W (CRT_W + 2 * GL_M)
 #define GL_H (CRT_H + 2 * GL_M)
+/* страница PAD: большие пады слева, маленький осциллограф справа сверху */
+#define PBZ_X 494
+#define PBZ_Y 46
+#define PBZ_W 394
+#define PBZ_H 158
+#define PCRT_X (PBZ_X + 16)
+#define PCRT_Y (PBZ_Y + 16)
+#define PCRT_W (PBZ_W - 32)
+#define PCRT_H (PBZ_H - 32)
+#define GL2_W (PCRT_W + 2 * GL_M)
+#define GL2_H (PCRT_H + 2 * GL_M)
+#define PAD_CY 42                  /* холст органов управления страницы PAD начинается ниже верхней планки */
+#define PAD_CH (SCR_H - PAD_CY)
 #define PN_X 10
 #define PN_Y 362
 #define PN_W 938
@@ -831,6 +844,8 @@ typedef struct {
 #define PAD_PK 208
 static Pad g_pad[PAD_N];
 static volatile int g_pe_vol = 80, g_pe_pitch = 24, g_pe_start = 0;   /* значения ручек выбранного пада */
+static volatile int g_pe_a = 0, g_pe_dc = 30, g_pe_s = 100, g_pe_r = 10;
+static int g_pad_env_sub = 0;                      /* подстраница PAD: 0 основная, 1 огибающая ADSR */
 typedef struct { int pad, stage, gate; double pos; float env, rel; } PVoice;   /* stage: 0 пусто, 1 A, 2 D, 3 S, 4 R */
 static PVoice g_pv[PAD_VOICES];
 static volatile unsigned g_pad_trig[PAD_N], g_pad_rel[PAD_N];
@@ -2241,10 +2256,22 @@ static void cv_blit_rot(Canvas *c, const Img *im, int sx, int sy, int sz, int cx
 static void cv_blit9(Canvas *c, const Img *im, int sx, int sy, int sz, int m, int dx, int dy, int dw, int dh) {
     int mid = sz - 2 * m, dmx = dw - 2 * m, dmy = dh - 2 * m;
     for (int y = 0; y < dh; y++) {
-        int ty = y < m ? y : (y >= dh - m ? sz - (dh - y) : m + (y - m) * mid / dmy);
+        float ty = y < m ? (float)y : (y >= dh - m ? (float)(sz - (dh - y)) : (float)m + ((float)(y - m) + 0.5f) * (float)mid / (float)dmy - 0.5f);
         for (int x = 0; x < dw; x++) {
-            int tx = x < m ? x : (x >= dw - m ? sz - (dw - x) : m + (x - m) * mid / dmx);
-            cv_put(c, dx + x, dy + y, im->px[(sy + ty) * im->w + sx + tx], 1.0f);
+            float tx = x < m ? (float)x : (x >= dw - m ? (float)(sz - (dw - x)) : (float)m + ((float)(x - m) + 0.5f) * (float)mid / (float)dmx - 0.5f);
+            if (tx < 0.0f) tx = 0.0f;
+            if (ty < 0.0f) ty = 0.0f;
+            int x0 = (int)tx, y0 = (int)ty, x1 = x0 + 1 < sz ? x0 + 1 : x0, y1 = y0 + 1 < sz ? y0 + 1 : y0;
+            float fx = tx - (float)x0, fy = ty - (float)y0;
+            uint32_t p00 = im->px[(sy + y0) * im->w + sx + x0], p10 = im->px[(sy + y0) * im->w + sx + x1];
+            uint32_t p01 = im->px[(sy + y1) * im->w + sx + x0], p11 = im->px[(sy + y1) * im->w + sx + x1];
+            uint32_t out = 0;
+            for (int sh = 0; sh < 32; sh += 8) {                    /* билинейно по каналам: растянутая середина не даёт блоков */
+                float a0 = (float)((p00 >> sh) & 255) * (1 - fx) + (float)((p10 >> sh) & 255) * fx;
+                float a1 = (float)((p01 >> sh) & 255) * (1 - fx) + (float)((p11 >> sh) & 255) * fx;
+                out |= (uint32_t)(a0 * (1 - fy) + a1 * fy + 0.5f) << sh;
+            }
+            cv_put(c, dx + x, dy + y, out, 1.0f);
         }
     }
 }
@@ -2543,7 +2570,7 @@ enum {
     B_SL_MINUS, B_SL_PLUS, B_BPM_MINUS, B_BPM_PLUS,
     B_TAB0, B_TAB1, B_TAB2, B_TAB3, B_TAB4, B_TAB5,
     B_ADV0, B_ADV1, B_ADV2, B_ADV3,
-    B_GR_ON, B_FSEC0, B_FSEC1, B_FT0, B_FT1, B_FT2, B_FT3, B_CURVE, B_PLOAD, B_PMODE,
+    B_GR_ON, B_FSEC0, B_FSEC1, B_FT0, B_FT1, B_FT2, B_FT3, B_CURVE, B_PLOAD, B_PMODE, B_PENV, B_PCLR,
     B_KNOB0 = 60,
     B_PAD0 = 100
 };
@@ -2579,9 +2606,9 @@ static void pad_geom(int i, int n, int *x, int *y, int *w, int *h) {
 
 /* сетка пэдов PAD: 4x4 */
 static void pad5_geom(int i, int *x, int *y, int *w, int *h) {
-    *w = (PADS_W - 18) / 4; *h = (PADS_H - 18) / 4;
-    *x = PADS_X + (i % 4) * (*w + 6);
-    *y = PADS_Y + (i / 4) * (*h + 6);
+    *w = 104; *h = 104;
+    *x = 18 + (i % 4) * 118;
+    *y = 52 + (i / 4) * 118;
 }
 
 /* ---------- ручки ---------- */
@@ -2594,7 +2621,7 @@ typedef struct {
 } KnobDef;
 enum { PG_EDIT = 1, PG_SLICE = 2, PG_GRAIN = 4, PG_FX = 8, PG_ADV = 16, PG_ALL = 31, PG_PAD = 32 };
 static const int g_tab_page[6] = { 0, 1, 2, 4, 3, 5 };      /* вкладки сверху: EDIT SLICE GRAIN ADV FX PAD -> номер страницы */
-#define N_KNOBS 15
+#define N_KNOBS 19
 static KnobDef g_kd[N_KNOBS];
 
 static void knobs_init(void) {
@@ -2611,9 +2638,13 @@ static void knobs_init(void) {
         { &g_fx[0],      16,  15, "BIT DEPTH", 470, 448, 30, PG_FX,   1 },
         { &g_fx[1],     101, 100, "SAMPLE RATE", 620, 448, 30, PG_FX, 1 },
         { &g_gr_det,    101,   0, "DETUNE",  728, 436, 28, PG_GRAIN, -1 },
-        { &g_pe_vol,    101,  80, "PAD VOLUME", 60, 438, 26, PG_PAD, -1 },
-        { &g_pe_pitch,   49,  24, "PAD PITCH", 152, 438, 26, PG_PAD, -1 },
-        { &g_pe_start,  100,   0, "START",   244, 438, 26, PG_PAD, -1 },
+        { &g_pe_vol,    101,  80, "VOLUME",  546, 290, 28, PG_PAD, 0 },
+        { &g_pe_pitch,   49,  24, "PITCH",   690, 290, 28, PG_PAD, 0 },
+        { &g_pe_start,  100,   0, "START",   834, 290, 28, PG_PAD, 0 },
+        { &g_pe_a,      101,   0, "ATTACK",  542, 290, 28, PG_PAD, 1 },
+        { &g_pe_dc,     101,  30, "DECAY",   638, 290, 28, PG_PAD, 1 },
+        { &g_pe_s,      101, 100, "SUSTAIN", 734, 290, 28, PG_PAD, 1 },
+        { &g_pe_r,      101,  10, "RELEASE", 830, 290, 28, PG_PAD, 1 },
     };
     memcpy(g_kd, k, sizeof(k));
 }
@@ -2621,6 +2652,7 @@ static void knobs_init(void) {
 static int knob_visible(int k, int page, int sec) {
     if (!(g_kd[k].pages & (1 << page))) return 0;
     if (page == 3 && g_kd[k].sec >= 0 && g_kd[k].sec != sec) return 0;
+    if (page == 5 && g_kd[k].sec >= 0 && g_kd[k].sec != g_pad_env_sub) return 0;
     return 1;
 }
 
@@ -2652,6 +2684,8 @@ static void knob_text(int k, char *out, size_t cap) {
     case 12: snprintf(out, cap, "%d %%", v); break;
     case 13: snprintf(out, cap, "%+d st", v - 24); break;
     case 14: snprintf(out, cap, "%d %%", v); break;
+    case 15: case 16: case 18: snprintf(out, cap, "%d ms", (int)(pad_ms(v) + 0.5f)); break;
+    case 17: snprintf(out, cap, "%d %%", v); break;
     default: { float d = (float)v / 100.0f; snprintf(out, cap, "%d ct", (int)(1200.0f * d * d + 0.5f)); break; }
     }
 }
@@ -2668,8 +2702,10 @@ static int btn_geom(int id, int *x, int *y, int *w, int *h) {
     case B_BPM_PLUS:  *x = 894; *y = 472; *w = 38; *h = 38; return 1;
     case B_GR_ON:     *x = 840; *y = 392; *w = 90; *h = 90; return 1;
     case B_CURVE:     *x = CURVE_X; *y = CURVE_Y; *w = CURVE_W; *h = CURVE_H; return 1;
-    case B_PLOAD:     *x = 796; *y = 384; *w = 136; *h = 62; return 1;
-    case B_PMODE:     *x = 796; *y = 456; *w = 136; *h = 62; return 1;
+    case B_PLOAD:     *x = 494; *y = 384; *w = 190; *h = 64; return 1;
+    case B_PMODE:     *x = 698; *y = 384; *w = 190; *h = 64; return 1;
+    case B_PENV:      *x = 494; *y = 462; *w = 190; *h = 64; return 1;
+    case B_PCLR:      *x = 698; *y = 462; *w = 190; *h = 64; return 1;
     }
     if (id >= B_FSEC0 && id <= B_FSEC1) { *x = 316 + (id - B_FSEC0) * 110; *y = 372; *w = 100; *h = 28; return 1; }
     if (id >= B_FT0 && id <= B_FT3) { int i = id - B_FT0; *x = 690 + (i % 2) * 62; *y = 410 + (i / 2) * 60; *w = 54; *h = 54; return 1; }
@@ -2678,9 +2714,9 @@ static int btn_geom(int id, int *x, int *y, int *w, int *h) {
 
 /* что под пальцем: кнопка, пад, ручка (B_KNOB0 + номер) */
 static int hit_test(int tx, int ty, int page, int sec, int sl_n) {
-    int ids[24], n = 0;
+    int ids[26], n = 0;
     ids[n++] = B_TAB0; ids[n++] = B_TAB1; ids[n++] = B_TAB2; ids[n++] = B_TAB3; ids[n++] = B_TAB4; ids[n++] = B_TAB5;
-    if (page == 5) { ids[n++] = B_PLOAD; ids[n++] = B_PMODE; }
+    if (page == 5) { ids[n++] = B_PLOAD; ids[n++] = B_PMODE; ids[n++] = B_PENV; ids[n++] = B_PCLR; }
     if (page == 0) { ids[n++] = B_CROP; ids[n++] = B_UNDO; ids[n++] = B_REV; ids[n++] = B_NORM; }
     if (page == 1) { ids[n++] = B_SL_MINUS; ids[n++] = B_SL_PLUS; ids[n++] = B_BPM_MINUS; ids[n++] = B_BPM_PLUS; }
     if (page == 2) ids[n++] = B_GR_ON;
@@ -2790,7 +2826,7 @@ static void meter_glass_render(Canvas *c) {
 /* ====================================================================
  *  Статичный фон (рисуется один раз): корпус, стеклянное окно с ЭЛТ, панель
  * ==================================================================== */
-static void skin_render_static(Canvas *c) {
+static void skin_render_static_ex(Canvas *c, int pad) {
     int have_body = g_img_body.px && g_img_body.w == c->w && g_img_body.h == c->h;
     if (have_body) memcpy(c->px, g_img_body.px, (size_t)c->w * c->h * 4);
     else {
@@ -2799,6 +2835,13 @@ static void skin_render_static(Canvas *c) {
         for (int x = 0; x < c->w; x++) c->px[y * c->w + x] = col;
     }
     cv_noise(c, 0, 0, c->w, c->h, 3);
+    }
+    if (pad && have_body) {                          /* страница PAD: нижняя панель корпуса не нужна - закрываем куском чистого фона */
+        for (int y = 354; y < c->h; y++)
+            for (int x = 0; x < c->w; x++) {
+                int sy = 353 - (y - 354) % 38, sxx = (x >= 894 && x <= 954) ? x - 70 : x;     /* зеркально от края: без шва */
+                c->px[y * c->w + x] = c->px[sy * c->w + sxx];
+            }
     }
 
     /* верхняя планка */
@@ -2810,23 +2853,35 @@ static void skin_render_static(Canvas *c) {
     for (int i = 0; i < 5; i++) cv_rrect(c, 19.5f + i * 3.6f, 20.0f - bh[i] * 0.5f, 2.0f, (float)bh[i], 1.0f, K_CREAM_HI);
 
     /* стеклянная рамка: толстое литое оранжево-коричневое стекло */
-    cv_shadow(c, BEZ_X, BEZ_Y, BEZ_W, BEZ_H, 10, 5);
-    cv_rrect_grad(c, BEZ_X, BEZ_Y, BEZ_W, BEZ_H, 10, RGBA8(232, 124, 34, 255), RGBA8(150, 62, 10, 255));
-    cv_rrect_stroke(c, BEZ_X, BEZ_Y, BEZ_W, BEZ_H, 10, 1.4f, RGBA8(96, 38, 6, 255));
-    cv_rrect_grad(c, BEZ_X + 3, BEZ_Y + 3, BEZ_W - 6, BEZ_H - 6, 8, RGBA8(248, 150, 56, 255), RGBA8(190, 82, 16, 255));
-    cv_rrect_grad(c, BEZ_X + 9, BEZ_Y + 8, BEZ_W - 18, BEZ_H - 17, 7, RGBA8(206, 96, 20, 255), RGBA8(120, 48, 8, 255));
-    cv_rrect_stroke(c, BEZ_X + 9, BEZ_Y + 8, BEZ_W - 18, BEZ_H - 17, 7, 1.0f, RGBA8(80, 30, 4, 255));
-    cv_rrect(c, BEZ_X + 14, BEZ_Y + 4.5f, BEZ_W - 28, 1.6f, 0.8f, RGBA8(255, 226, 180, 190));
-    cv_rrect(c, BEZ_X + 4.5f, BEZ_Y + 16, 1.4f, BEZ_H - 34, 0.7f, RGBA8(255, 200, 140, 90));
-    cv_rrect(c, BEZ_X + 14, BEZ_Y + BEZ_H - 5.5f, BEZ_W - 28, 1.2f, 0.6f, RGBA8(255, 170, 90, 120));
+    {
+        const int bx = pad ? PBZ_X : BEZ_X, by = pad ? PBZ_Y : BEZ_Y, bw = pad ? PBZ_W : BEZ_W, bh = pad ? PBZ_H : BEZ_H;
+        const int cx = bx + 16, cy = by + 16, cw = bw - 32, ch = bh - 32;
+        cv_shadow(c, bx, by, bw, bh, 10, 5);
+        cv_rrect_grad(c, bx, by, bw, bh, 10, RGBA8(232, 124, 34, 255), RGBA8(150, 62, 10, 255));
+        cv_rrect_stroke(c, bx, by, bw, bh, 10, 1.4f, RGBA8(96, 38, 6, 255));
+        cv_rrect_grad(c, bx + 3, by + 3, bw - 6, bh - 6, 8, RGBA8(248, 150, 56, 255), RGBA8(190, 82, 16, 255));
+        cv_rrect_grad(c, bx + 9, by + 8, bw - 18, bh - 17, 7, RGBA8(206, 96, 20, 255), RGBA8(120, 48, 8, 255));
+        cv_rrect_stroke(c, bx + 9, by + 8, bw - 18, bh - 17, 7, 1.0f, RGBA8(80, 30, 4, 255));
+        cv_rrect(c, bx + 14, by + 4.5f, bw - 28, 1.6f, 0.8f, RGBA8(255, 226, 180, 190));
+        cv_rrect(c, bx + 4.5f, by + 16, 1.4f, bh - 34, 0.7f, RGBA8(255, 200, 140, 90));
+        cv_rrect(c, bx + 14, by + bh - 5.5f, bw - 28, 1.2f, 0.6f, RGBA8(255, 170, 90, 120));
 
-    /* ЭЛТ: тёмная трубка, сетка */
-    cv_rrect_grad(c, CRT_X, CRT_Y, CRT_W, CRT_H, 9, RGBA8(30, 20, 14, 255), RGBA8(12, 8, 5, 255));
-    for (int i = 1; i < 4; i++) {
-        int yy = WAVE_Y + i * WAVE_H / 4;
-        for (int x = WAVE_X; x < WAVE_X + WAVE_W; x += 8) cv_rect(c, x, yy, 4, 1, RGBA8(255, 150, 46, 34));
+        /* ЭЛТ: тёмная трубка, сетка */
+        cv_rrect_grad(c, cx, cy, cw, ch, 9, RGBA8(30, 20, 14, 255), RGBA8(12, 8, 5, 255));
+        if (!pad) {
+            for (int i = 1; i < 4; i++) {
+                int yy = WAVE_Y + i * WAVE_H / 4;
+                for (int x = WAVE_X; x < WAVE_X + WAVE_W; x += 8) cv_rect(c, x, yy, 4, 1, RGBA8(255, 150, 46, 34));
+            }
+            for (int i = 1; i < 16; i++) cv_rect(c, WAVE_X + i * WAVE_W / 16, WAVE_Y, 1, WAVE_H, RGBA8(255, 150, 46, 20));
+        } else {
+            for (int i = 1; i < 4; i++) {
+                int yy = 102 + i * 82 / 4;
+                for (int x = 518; x < 518 + 346; x += 8) cv_rect(c, x, yy, 4, 1, RGBA8(255, 150, 46, 34));
+            }
+            for (int i = 1; i < 12; i++) cv_rect(c, 518 + i * 346 / 12, 102, 1, 82, RGBA8(255, 150, 46, 20));
+        }
     }
-    for (int i = 1; i < 16; i++) cv_rect(c, WAVE_X + i * WAVE_W / 16, WAVE_Y, 1, WAVE_H, RGBA8(255, 150, 46, 20));
 
     /* индикатор уровня: врезанная панель, стеклянная трубка, засечки, окна пика и перегруза */
     if (!have_body) {
@@ -2851,7 +2906,7 @@ static void skin_render_static(Canvas *c) {
     }
 
     /* панель управления (при наличии body.png она уже нарисована в фоне) */
-    if (!have_body) {
+    if (!have_body && !pad) {
         cv_shadow(c, PN_X, PN_Y, PN_W, PN_H, 4, 2);
         cv_rrect_grad(c, PN_X, PN_Y, PN_W, PN_H, 4, RGBA8(214, 208, 190, 255), RGBA8(196, 189, 170, 255));
         cv_rrect_stroke(c, PN_X, PN_Y, PN_W, PN_H, 4, 1.0f, K_EDGE);
@@ -2860,6 +2915,8 @@ static void skin_render_static(Canvas *c) {
         cv_rect(c, 293, 376, 1, 146, RGBA8(255, 255, 255, 140));
     }
 }
+
+static void skin_render_static(Canvas *c) { skin_render_static_ex(c, 0); }
 
 /* знаковое расстояние до скруглённого прямоугольника (внутри < 0) */
 static float sd_rrect(float px, float py, float x0, float y0, float w, float h, float r) {
@@ -2871,20 +2928,20 @@ static float sd_rrect(float px, float py, float x0, float y0, float w, float h, 
 
 /* выпуклое стекло ЭЛТ (холст GL_W x GL_H: экран + поле GL_M для литой кромки): светится центр, края темнее,
  * кромка стекла со скосом, тень от оправы сверху-слева, отражение софтбокса и дуга бликов вдоль края, строки развёртки */
-static void glass_render(Canvas *c) {
+static void glass_render_ex(Canvas *c, const int cw, const int ch) {
     const float CR = 9.0f;
     for (int y = 0; y < c->h; y++)
         for (int x = 0; x < c->w; x++) {
             float fx = (float)x + 0.5f - GL_M, fy = (float)y + 0.5f - GL_M;           /* координаты относительно экрана */
-            float d = sd_rrect(fx, fy, 0.0f, 0.0f, (float)CRT_W, (float)CRT_H, CR);
+            float d = sd_rrect(fx, fy, 0.0f, 0.0f, (float)cw, (float)ch, CR);
             uint32_t *dp = &c->px[y * c->w + x];
             *dp = 0;
             /* нормаль к краю (наружу) */
-            float qx = fabsf(fx - CRT_W * 0.5f) - (CRT_W * 0.5f - CR), qy = fabsf(fy - CRT_H * 0.5f) - (CRT_H * 0.5f - CR);
+            float qx = fabsf(fx - cw * 0.5f) - (cw * 0.5f - CR), qy = fabsf(fy - ch * 0.5f) - (ch * 0.5f - CR);
             float nx = qx > 0.0f ? qx : 0.0f, ny = qy > 0.0f ? qy : 0.0f;
             if (nx == 0.0f && ny == 0.0f) { if (qx > qy) nx = 1.0f; else ny = 1.0f; }
             float nl = sqrtf(nx * nx + ny * ny);
-            nx = (fx < CRT_W * 0.5f ? -nx : nx) / nl; ny = (fy < CRT_H * 0.5f ? -ny : ny) / nl;
+            nx = (fx < cw * 0.5f ? -nx : nx) / nl; ny = (fy < ch * 0.5f ? -ny : ny) / nl;
             float lit = nx * -0.62f + ny * -0.78f;                                     /* >0: край обращён к свету (сверху-слева) */
             if (d > 0.0f) {
                 if (d > (float)GL_M) continue;
@@ -2897,7 +2954,7 @@ static void glass_render(Canvas *c) {
             }
             float in = -d;
             cv_put(c, x, y, RGBA8(255, 120, 20, 255), 0.06f);                       /* оранжевое стекло */
-            float ex = (fx / (CRT_W * 0.5f) - 1.0f), ey = (fy / (CRT_H * 0.5f) - 1.0f);
+            float ex = (fx / (cw * 0.5f) - 1.0f), ey = (fy / (ch * 0.5f) - 1.0f);
             float rr = powf(powf(fabsf(ex), 2.6f) + powf(fabsf(ey), 2.6f), 1.0f / 2.6f);   /* суперэллипс: 0 в центре, 1 у края */
             float glow = 1.0f - rr * rr;
             if (glow > 0.0f) cv_put(c, x, y, RGBA8(255, 150, 50, 255), 0.05f * glow);   /* свечение люминофора в центре */
@@ -2909,18 +2966,19 @@ static void glass_render(Canvas *c) {
             if (lit > 0.35f && in > 4.0f && in < 8.0f) {
                 float k = (in - 4.0f) / 4.0f; k = 1.0f - fabsf(k * 2.0f - 1.0f);
                 float fade = fclampf((lit - 0.35f) / 0.65f, 0.0f, 1.0f);
-                float along = (fx + fy * 0.4f) / (float)CRT_W;
+                float along = (fx + fy * 0.4f) / (float)cw;
                 float f2 = along < 0.55f ? 1.0f - along / 0.55f : 0.0f;
                 cv_put(c, x, y, RGBA8(255, 230, 190, 255), 0.30f * k * fade * f2);
             }
             {                                                                       /* слабые вторичные отражения у краёв: не мешают тексту */
-                float rx = (fx - 0.90f * CRT_W) / (0.10f * CRT_W), ry = (fy - 0.80f * CRT_H) / (0.18f * CRT_H);
+                float rx = (fx - 0.90f * cw) / (0.10f * cw), ry = (fy - 0.80f * ch) / (0.18f * ch);
                 float re = 1.0f - (rx * rx + ry * ry);
                 if (re > 0.0f) cv_put(c, x, y, RGBA8(255, 200, 140, 255), 0.06f * re);
             }
             if (y % 3 == 1) cv_put(c, x, y, RGBA8(0, 0, 0, 255), 0.15f * (1.0f - 0.5f * glow));   /* строки развёртки: к краям заметнее */
         }
 }
+static void glass_render(Canvas *c) { glass_render_ex(c, CRT_W, CRT_H); }
 
 /* ====================================================================
  *  Верхняя планка: лампы REC / PLAY / LOOP и BPM сегментными цифрами
@@ -2940,15 +2998,15 @@ static void top_render(Canvas *c, const UiState *u) {
 /* ====================================================================
  *  Органы управления: каждая деталь перерисовывается ТОЛЬКО когда изменилось её состояние
  * ==================================================================== */
-#define W_KNOB0   0            /* 0..11  ручки */
-#define W_EDIT0   12           /* 12..15 кнопки EDIT */
-#define W_PAD0    16           /* 16..47 пэды */
-#define W_SIDE0   48           /* 48..51 кнопки справа в SLICE */
-#define W_SEG0    52           /* 52..53 сегментные значения */
-#define W_GRON    54
-#define W_FT0     55           /* 55..58 типы фильтра */
-#define W_CURVE   59
-#define W_COUNT   60
+#define W_KNOB0   0            /* 0..19  ручки */
+#define W_EDIT0   20           /* 20..23 кнопки EDIT */
+#define W_PAD0    24           /* 24..55 пэды */
+#define W_SIDE0   56           /* 56..59 кнопки справа в SLICE / кнопки PAD */
+#define W_SEG0    60           /* 60..61 сегментные значения */
+#define W_GRON    62
+#define W_FT0     63           /* 63..66 типы фильтра */
+#define W_CURVE   67
+#define W_COUNT   68
 static int g_wcode[W_COUNT];
 static int g_page_key = -1;
 
@@ -3034,18 +3092,24 @@ static void draw_curve(Canvas *c, int cy0) {
 
 
 /* ====================================================================
- *  PAD: интерфейс (сетка 4x4, список WAV, огибающая ADSR на экране ЭЛТ)
+ *  PAD: интерфейс (большие пады 4x4 слева, маленький осциллограф и ручки справа, список WAV, подстраница ADSR)
  * ==================================================================== */
-#define ENV_X WAVE_X
-#define ENV_Y 106
-#define ENV_W WAVE_W
-#define ENV_H 176
-#define ENV_PX 2.2f                  /* пикселей экрана на единицу времени A / D / R */
-#define ENV_HOLD 130.0f              /* длина участка выдержки */
-#define ENV_L 24.0f
-#define ENV_TOP 16.0f
-#define ENV_BASE (ENV_H - 24.0f)
-#define PL_ROWS 9
+#define ENV_X 518                    /* окно осциллографа */
+#define ENV_Y 102
+#define ENV_W 346
+#define ENV_H 82
+#define ENV_PX 0.8f                  /* пикселей на единицу времени A / D / R */
+#define ENV_HOLD 40.0f
+#define ENV_L 4.0f
+#define ENV_TOP 6.0f
+#define ENV_BASE (ENV_H - 6.0f)
+#define LST_X 494                    /* список WAV занимает нижнюю правую часть, пады остаются доступны */
+#define LST_Y 212
+#define LST_W 394
+#define LST_H 322
+#define LST_ROW0 (LST_Y + 38)
+#define LST_RH 27
+#define PL_ROWS 10
 #define PL_MAX 200
 #define PAD_DIR "ux0:data/Sampler"
 typedef struct {
@@ -3061,25 +3125,33 @@ static void pad_mark_dirty(void) { g_pu.cfg_dirty = 1; g_pu.cfg_cnt = 0; }
 
 /* значения ручек <-> выбранный пад (по теневой копии: двойной тап по ручке тоже записывается) */
 static void pad_sync(void) {
-    static int sh[3], sh_sel = -1;
+    static int sh[7], sh_sel = -1;
     Pad *p = &g_pad[g_pu.sel];
+    int *pv[7] = { &p->vol, &p->pitch, &p->start, &p->a, &p->dc, &p->s, &p->r };
+    volatile int *ev[7] = { &g_pe_vol, &g_pe_pitch, &g_pe_start, &g_pe_a, &g_pe_dc, &g_pe_s, &g_pe_r };
     if (g_pu.sel != sh_sel) {
-        g_pe_vol = p->vol; g_pe_pitch = p->pitch; g_pe_start = p->start;
-        sh[0] = p->vol; sh[1] = p->pitch; sh[2] = p->start;
+        for (int i = 0; i < 7; i++) { *ev[i] = *pv[i]; sh[i] = *pv[i]; }
         sh_sel = g_pu.sel;
         return;
     }
-    int ev = g_pe_vol, ep = g_pe_pitch, es = g_pe_start;
-    if (ev != sh[0] || ep != sh[1] || es != sh[2]) {
-        p->vol = ev; p->pitch = ep; p->start = es;
-        sh[0] = ev; sh[1] = ep; sh[2] = es;
+    int changed = 0;
+    for (int i = 0; i < 7; i++) if (*ev[i] != sh[i]) changed = 1;
+    if (changed) {
+        for (int i = 0; i < 7; i++) { *pv[i] = *ev[i]; sh[i] = *ev[i]; }
         pad_mark_dirty();
-    } else {                                           /* пад поменялся не от ручки (загрузка) - подтянуть */
-        if (p->vol != ev || p->pitch != ep || p->start != es) {
-            g_pe_vol = p->vol; g_pe_pitch = p->pitch; g_pe_start = p->start;
-            sh[0] = p->vol; sh[1] = p->pitch; sh[2] = p->start;
-        }
     }
+}
+
+static void pad_clear(int i) {
+    Pad *p = &g_pad[i];
+    if (!p->d) return;
+    p->loading = 1;
+    sceKernelDelayThread(60000);
+    int16_t *old = p->d;
+    p->d = NULL; p->n = 0; p->path[0] = 0; p->name[0] = 0;
+    memset(p->pk, 0, sizeof(p->pk));
+    p->loading = 0;
+    free(old);
 }
 
 static int pl_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
@@ -3100,7 +3172,7 @@ static void pad_list_scan(void) {
     qsort(g_pu.list, (size_t)g_pu.list_n, 40, pl_cmp);
 }
 
-/* ---- огибающая: точки в координатах холста ---- */
+/* ---- огибающая: точки в координатах окна осциллографа ---- */
 static void env_points(const Pad *p, float *px, float *py) {
     float ys = ENV_BASE - (ENV_BASE - ENV_TOP) * (float)p->s / 100.0f;
     px[0] = ENV_L;                         py[0] = ENV_BASE;
@@ -3109,83 +3181,55 @@ static void env_points(const Pad *p, float *px, float *py) {
     px[3] = px[2] + ENV_HOLD;              py[3] = ys;
     px[4] = px[3] + (float)p->r * ENV_PX;  py[4] = ENV_BASE;
 }
-static int env_clamp(float v) { return v < 0.0f ? 0 : (v > 100.0f ? 100 : (int)(v + 0.5f)); }
-/* перетаскивание ручки огибающей: k = 0 атака, 1 спад + уровень, 2 затухание; x, y - экранные */
-static void env_drag(int k, float x, float y) {
-    Pad *p = &g_pad[g_pu.sel];
-    float cx = x - ENV_X, cy = y - ENV_Y, px[5], py[5];
-    env_points(p, px, py);
-    if (k == 0) p->a = env_clamp((cx - px[0]) / ENV_PX);
-    else if (k == 1) {
-        p->dc = env_clamp((cx - px[1]) / ENV_PX);
-        p->s = env_clamp(100.0f * (ENV_BASE - cy) / (ENV_BASE - ENV_TOP));
-    } else p->r = env_clamp((cx - px[3]) / ENV_PX);
-    pad_mark_dirty();
-}
-/* ближайшая ручка огибающей к точке экрана: 0..2 или -1 */
-static int env_pick(float x, float y) {
-    const Pad *p = &g_pad[g_pu.sel];
-    float px[5], py[5];
-    env_points(p, px, py);
-    static const int idx[3] = { 1, 2, 4 };
-    int best = -1; float bd = 40.0f * 40.0f;
-    for (int k = 0; k < 3; k++) {
-        float dx = x - (float)ENV_X - px[idx[k]], dy = y - (float)ENV_Y - py[idx[k]], d = dx * dx + dy * dy;
-        if (d < bd) { bd = d; best = k; }
-    }
-    return best;
-}
 
-static void env_render(Canvas *c, const Pad *p) {
+/* осциллограф: форма волны выбранного сэмпла; на подстранице ADSR поверх неё - огибающая */
+static void env_render(Canvas *c, const Pad *p, int with_env) {
     cv_clear(c, 0);
-    for (int x = 0; x < c->w; x += 8) {                       /* линии сетки */
-        cv_rect(c, x, (int)ENV_BASE, 4, 1, RGBA8(255, 150, 46, 60));
-        cv_rect(c, x, (int)ENV_TOP, 4, 1, RGBA8(255, 150, 46, 34));
-    }
-    if (p->d) {                                                /* волна сэмпла под огибающей */
-        float mid = (ENV_BASE + ENV_TOP) * 0.5f, amp = (ENV_BASE - ENV_TOP) * 0.5f;
+    float mid = (ENV_BASE + ENV_TOP) * 0.5f, amp = (ENV_BASE - ENV_TOP) * 0.5f;
+    cv_rect(c, 0, (int)mid, c->w, 1, RGBA8(255, 150, 46, 60));
+    if (p->d) {
         for (int i = 0; i < PAD_PK; i++) {
             int hh = (int)((float)p->pk[i] / 255.0f * amp);
-            cv_rect(c, i * c->w / PAD_PK, (int)mid - hh, 3, 2 * hh + 1, RGBA8(255, 170, 70, 62));
+            int x0 = i * c->w / PAD_PK, x1 = (i + 1) * c->w / PAD_PK;
+            cv_rect(c, x0, (int)mid - hh, x1 - x0 > 1 ? x1 - x0 : 1, 2 * hh + 1, RGBA8(255, 190, 90, with_env ? 150 : 235));
         }
         int sx = (int)((float)c->w * (float)p->start / 100.0f);
-        cv_rect(c, sx, (int)ENV_TOP - 6, 1, (int)(ENV_BASE - ENV_TOP) + 12, RGBA8(120, 230, 140, 200));
-        cv_rect(c, sx, (int)ENV_TOP - 6, 7, 3, RGBA8(120, 230, 140, 200));
+        cv_rect(c, sx, 0, 1, c->h, RGBA8(120, 230, 140, 190));
+        cv_rect(c, sx, 0, 6, 2, RGBA8(120, 230, 140, 190));
     }
-    float px[5], py[5];
-    env_points(p, px, py);
-    for (int x = (int)px[0]; x <= (int)px[4]; x++) {           /* заливка под кривой */
-        float y = py[4];
-        for (int k = 0; k < 4; k++)
-            if ((float)x >= px[k] && (float)x <= px[k + 1]) {
-                float t = px[k + 1] > px[k] ? ((float)x - px[k]) / (px[k + 1] - px[k]) : 1.0f;
-                y = py[k] + (py[k + 1] - py[k]) * t;
-                break;
-            }
-        cv_rect(c, x, (int)y, 1, (int)(ENV_BASE - y) + 1, RGBA8(233, 106, 38, 54));
-    }
-    for (int k = 0; k < 4; k++) cv_line(c, px[k], py[k], px[k + 1], py[k + 1], 1.5f, RGBA8(255, 214, 128, 255));
-    static const int idx[3] = { 1, 2, 4 };
-    for (int k = 0; k < 3; k++) {                              /* ручки A, D(+S), R */
-        cv_circle(c, px[idx[k]], py[idx[k]], 8.0f, RGBA8(40, 22, 10, 255));
-        cv_ring(c, px[idx[k]], py[idx[k]], 8.0f, 2.0f, RGBA8(255, 224, 120, 255));
-        cv_circle(c, px[idx[k]], py[idx[k]], 3.0f, RGBA8(255, 150, 46, 255));
+    if (with_env) {
+        float px[5], py[5];
+        env_points(p, px, py);
+        for (int x = (int)px[0]; x <= (int)px[4] && x < c->w; x++) {
+            float y = py[4];
+            for (int k = 0; k < 4; k++)
+                if ((float)x >= px[k] && (float)x <= px[k + 1]) {
+                    float t = px[k + 1] > px[k] ? ((float)x - px[k]) / (px[k + 1] - px[k]) : 1.0f;
+                    y = py[k] + (py[k + 1] - py[k]) * t;
+                    break;
+                }
+            cv_rect(c, x, (int)y, 1, (int)(ENV_BASE - y) + 1, RGBA8(233, 106, 38, 60));
+        }
+        for (int k = 0; k < 4; k++) cv_line(c, px[k], py[k], px[k + 1], py[k + 1], 1.3f, RGBA8(255, 232, 160, 255));
+        static const int idx[3] = { 1, 2, 4 };
+        for (int k = 0; k < 3; k++) cv_circle(c, px[idx[k]], py[idx[k]], 3.2f, RGBA8(255, 232, 160, 255));
     }
 }
 
-/* клавиша-пад 113x33: нажатый или выбранный залипает, оранжевый - выбранный, точка - сэмпл назначен (ярче - звучит) */
-static void cv_padcell(Canvas *c, int x, int y, int w, int h, int sel, int pr, int has, int play) {
-    uint32_t top = RGBA8(249, 245, 232, 255), bot = RGBA8(219, 213, 195, 255), edge = RGBA8(150, 142, 120, 255), side = RGBA8(170, 162, 140, 255);
-    if (sel) { top = K_ORANGE_HI; bot = K_ORANGE; edge = K_ORANGE_LO; side = RGBA8(150, 58, 12, 255); }
+/* пад 104x104: объёмная клавиша; выбранный - оранжевый и залипает; внутри номер, мини-волна, имя (текст рисуется отдельно) */
+static void cv_padcell(Canvas *c, int x, int y, int w, int h, int sel, int pr, int has, int play, const Pad *p) {
+    cv_key(c, x, y, w, h, sel ? 1 : 0, pr);
     int off = pr ? 2 : 0;
-    if (!pr) cv_rrect(c, (float)x, (float)(y + 3), (float)w, (float)h, 4.0f, side);
-    if (pr) { uint32_t t = top; top = bot; bot = t; }
-    cv_rrect_grad(c, (float)x, (float)(y + off), (float)w, (float)h, 4.0f, top, bot);
-    cv_rrect_stroke(c, (float)x, (float)(y + off), (float)w, (float)h, 4.0f, 1.0f, edge);
-    if (!pr) cv_rrect(c, (float)(x + 4), (float)y + 1.5f, (float)(w - 8), 1.2f, 0.6f, RGBA8(255, 255, 255, 110));
     if (has) {
-        cv_circle(c, (float)(x + w - 10), (float)(y + off + 10), 4.4f, RGBA8(60, 40, 20, 255));
-        cv_circle(c, (float)(x + w - 10), (float)(y + off + 10), 3.2f, play ? RGBA8(255, 226, 90, 255) : RGBA8(70, 170, 90, 255));
+        cv_circle(c, (float)(x + w - 16), (float)(y + off + 17), 5.6f, RGBA8(60, 40, 20, 255));
+        cv_circle(c, (float)(x + w - 16), (float)(y + off + 17), 4.2f, play ? RGBA8(255, 226, 90, 255) : RGBA8(70, 170, 90, 255));
+        const int nb = 38;
+        for (int i = 0; i < nb; i++) {
+            int a0 = i * PAD_PK / nb, mx = 0;
+            for (int q = a0; q < a0 + PAD_PK / nb + 1 && q < PAD_PK; q++) if (p->pk[q] > mx) mx = p->pk[q];
+            int hh = (int)((float)mx / 255.0f * 17.0f);
+            cv_rect(c, x + 14 + i * 2, y + off + 58 - hh, 2, 2 * hh + 1, sel ? RGBA8(120, 46, 8, 210) : RGBA8(104, 92, 72, 200));
+        }
     }
 }
 
@@ -3198,7 +3242,8 @@ static int edit_style(const UiState *u, int id) {
 /* Обновляет холст органов управления страницы. Возвращает 1, если что-то изменилось. */
 static int ctl_update(Canvas *c, const UiState *u) {
     const int page = u->page;
-    int key = page * 1000 + (page == 1 ? u->sl_n : 0) + (page == 3 ? u->fx_sec * 100 : 0);
+    const int oy = (page == 5) ? PAD_CY : CTL_TY;
+    int key = page * 1000 + (page == 1 ? u->sl_n : 0) + (page == 3 ? u->fx_sec * 100 : 0) + (page == 5 ? g_pad_env_sub * 100 : 0);
     int changed = 0;
     if (key != g_page_key) {
         cv_clear(c, 0);
@@ -3211,8 +3256,8 @@ static int ctl_update(Canvas *c, const UiState *u) {
         int dim = (k == 8 && u->flt_type != 3) || (k == 7 && u->flt_type == 0);
         int code = (((int)*g_kd[k].v + 1) << 3) | ((u->knob_down == k) << 1) | dim;
         if (code != g_wcode[W_KNOB0 + k]) {
-            cv_clear_rect(c, g_kd[k].cx - g_kd[k].r - 13, g_kd[k].cy - g_kd[k].r - 13 - CTL_TY, 2 * g_kd[k].r + 26, 2 * g_kd[k].r + 26);
-            cv_knob(c, g_kd[k].cx, g_kd[k].cy - CTL_TY, g_kd[k].r, (float)*g_kd[k].v / (float)(g_kd[k].n - 1), u->knob_down == k, dim);
+            cv_clear_rect(c, g_kd[k].cx - g_kd[k].r - 13, g_kd[k].cy - g_kd[k].r - 13 - oy, 2 * g_kd[k].r + 26, 2 * g_kd[k].r + 26);
+            cv_knob(c, g_kd[k].cx, g_kd[k].cy - oy, g_kd[k].r, (float)*g_kd[k].v / (float)(g_kd[k].n - 1), u->knob_down == k, dim);
             g_wcode[W_KNOB0 + k] = code;
             changed = 1;
         }
@@ -3304,22 +3349,24 @@ static int ctl_update(Canvas *c, const UiState *u) {
             int x, y, w, h;
             pad5_geom(i, &x, &y, &w, &h);
             int has = g_pad[i].d != NULL, pl = (g_pad_mask >> i) & 1, dn = (g_pu.down_mask >> i) & 1, sl = (g_pu.sel == i);
-            int code = 1 + sl * 2 + has * 4 + pl * 8 + dn * 16;
+            int code = 1 + sl * 2 + has * 4 + pl * 8 + dn * 16 + (has ? g_pad[i].pk[7] * 32 + g_pad[i].pk[100] * 8192 : 0);
             if (code != g_wcode[W_PAD0 + i]) {
-                cv_clear_part(c, x, y - CTL_TY, w, h);
-                cv_padcell(c, x, y - CTL_TY, w, h, sl, sl || dn, has, pl);
+                cv_clear_part(c, x, y - oy, w, h);
+                cv_padcell(c, x, y - oy, w, h, sl, sl || dn, has, pl, &g_pad[i]);
                 g_wcode[W_PAD0 + i] = code;
                 changed = 1;
             }
         }
-        for (int k = 0; k < 2; k++) {
-            int id = k ? B_PMODE : B_PLOAD;
-            int code = 1 + 4 * (u->btn_down == id) + (k ? 8 * g_pad[g_pu.sel].mode : 2 * g_pu.list_open);
+        static const int pids[4] = { B_PLOAD, B_PMODE, B_PENV, B_PCLR };
+        for (int k = 0; k < 4; k++) {
+            int id = pids[k];
+            int on = (k == 0 && g_pu.list_open) || (k == 2 && g_pad_env_sub);
+            int code = 1 + 4 * (u->btn_down == id) + 2 * on + (k == 1 ? 8 * g_pad[g_pu.sel].mode : 0);
             if (code != g_wcode[W_SIDE0 + k]) {
                 int x, y, w, h;
                 btn_geom(id, &x, &y, &w, &h);
-                cv_clear_part(c, x, y - CTL_TY, w, h);
-                cv_key(c, x, y - CTL_TY, w, h, 0, (u->btn_down == id) || (k == 0 && g_pu.list_open));
+                cv_clear_part(c, x, y - oy, w, h);
+                cv_key(c, x, y - oy, w, h, 0, (u->btn_down == id) || on);
                 g_wcode[W_SIDE0 + k] = code;
                 changed = 1;
             }
@@ -3361,7 +3408,8 @@ static int ctl_update(Canvas *c, const UiState *u) {
  *  Текстуры интерфейса и их обновление
  * ==================================================================== */
 static vita2d_texture *g_tex_bg = NULL, *g_tex_top[2], *g_tex_ctl[3], *g_tex_glass = NULL, *g_tex_meter = NULL;
-static Canvas g_cv_bg, g_cv_top, g_cv_glass, g_cv_page[6];     /* панель управления: по холсту на страницу */
+static vita2d_texture *g_tex_bgpad = NULL, *g_tex_glass2 = NULL, *g_tex_pctl[3];
+static Canvas g_cv_bg, g_cv_top, g_cv_glass, g_cv_page[6], g_cv_bgpad, g_cv_glass2;     /* панель управления: по холсту на страницу */
 static int g_wcodes[6][W_COUNT], g_page_keys[6] = { -1, -1, -1, -1, -1, -1 }, g_last_page = -1, g_last_key = -1;
 static uint32_t g_sig_top = 0;
 static int g_top_cur = -1, g_ctl_cur = -1, g_top_next = 0, g_ctl_next = 0;
@@ -3382,6 +3430,9 @@ static void upload_canvas(vita2d_texture *tex, const Canvas *c) {
 static void ui_create_textures(void) {
     g_tex_bg = vita2d_create_empty_texture(SCR_W, SCR_H);
     g_tex_glass = vita2d_create_empty_texture(GL_W, GL_H);
+    g_tex_bgpad = vita2d_create_empty_texture(SCR_W, SCR_H);
+    g_tex_glass2 = vita2d_create_empty_texture(GL2_W, GL2_H);
+    for (int i = 0; i < 3; i++) g_tex_pctl[i] = vita2d_create_empty_texture(SCR_W, PAD_CH);
     g_tex_meter = vita2d_create_empty_texture(METER_W, METER_H);
     upload_canvas(g_tex_meter, &g_cv_meter);
     g_tex_mglass = vita2d_create_empty_texture(METER_W + 8, METER_H + 8);
@@ -3390,6 +3441,8 @@ static void ui_create_textures(void) {
     for (int i = 0; i < 3; i++) g_tex_ctl[i] = vita2d_create_empty_texture(SCR_W, CTL_TH);
     upload_canvas(g_tex_bg, &g_cv_bg);
     upload_canvas(g_tex_glass, &g_cv_glass);
+    upload_canvas(g_tex_bgpad, &g_cv_bgpad);
+    upload_canvas(g_tex_glass2, &g_cv_glass2);
     for (int i = 0; i < 2; i++) g_tex_env[i] = vita2d_create_empty_texture(ENV_W, ENV_H);
     g_env_cur = -1; g_sig_env = 0;
     g_sig_top = 0xFFFFFFFFu;
@@ -3404,8 +3457,8 @@ static int ui_init(void) {
     g_cv_top.w = SCR_W; g_cv_top.h = TOP_H; g_cv_top.px = (uint32_t *)malloc((size_t)SCR_W * TOP_H * 4);
     g_cv_glass.w = GL_W; g_cv_glass.h = GL_H; g_cv_glass.px = (uint32_t *)calloc((size_t)GL_W * GL_H, 4);
     for (int i = 0; i < 6; i++) {
-        g_cv_page[i].w = SCR_W; g_cv_page[i].h = CTL_TH;
-        g_cv_page[i].px = (uint32_t *)calloc((size_t)SCR_W * CTL_TH, 4);
+        g_cv_page[i].w = SCR_W; g_cv_page[i].h = (i == 5) ? PAD_CH : CTL_TH;
+        g_cv_page[i].px = (uint32_t *)calloc((size_t)SCR_W * g_cv_page[i].h, 4);
         g_page_keys[i] = -1;
     }
     if (!g_cv_bg.px || !g_cv_top.px || !g_cv_glass.px) return 0;
@@ -3418,8 +3471,13 @@ static int ui_init(void) {
     meter_glass_render(&g_cv_mglass);
     g_cv_env.w = ENV_W; g_cv_env.h = ENV_H; g_cv_env.px = (uint32_t *)calloc((size_t)ENV_W * ENV_H, 4);
     if (!g_cv_env.px) return 0;
+    g_cv_bgpad.w = SCR_W; g_cv_bgpad.h = SCR_H; g_cv_bgpad.px = (uint32_t *)malloc((size_t)SCR_W * SCR_H * 4);
+    g_cv_glass2.w = GL2_W; g_cv_glass2.h = GL2_H; g_cv_glass2.px = (uint32_t *)calloc((size_t)GL2_W * GL2_H, 4);
+    if (!g_cv_bgpad.px || !g_cv_glass2.px) return 0;
     skin_render_static(&g_cv_bg);
+    skin_render_static_ex(&g_cv_bgpad, 1);
     glass_render(&g_cv_glass);
+    glass_render_ex(&g_cv_glass2, PCRT_W, PCRT_H);
     ui_create_textures();
     return 1;
 }
@@ -3427,6 +3485,9 @@ static int ui_init(void) {
 static void ui_free_textures(void) {
     if (g_tex_bg) { vita2d_free_texture(g_tex_bg); g_tex_bg = NULL; }
     if (g_tex_glass) { vita2d_free_texture(g_tex_glass); g_tex_glass = NULL; }
+    if (g_tex_bgpad) { vita2d_free_texture(g_tex_bgpad); g_tex_bgpad = NULL; }
+    if (g_tex_glass2) { vita2d_free_texture(g_tex_glass2); g_tex_glass2 = NULL; }
+    for (int i = 0; i < 3; i++) if (g_tex_pctl[i]) { vita2d_free_texture(g_tex_pctl[i]); g_tex_pctl[i] = NULL; }
     if (g_tex_meter) { vita2d_free_texture(g_tex_meter); g_tex_meter = NULL; }
     if (g_tex_mglass) { vita2d_free_texture(g_tex_mglass); g_tex_mglass = NULL; }
     for (int i = 0; i < 2; i++) if (g_tex_top[i]) { vita2d_free_texture(g_tex_top[i]); g_tex_top[i] = NULL; }
@@ -3457,11 +3518,11 @@ static void ui_update_textures(const UiState *u) {
     if (u->page == 5) {                                    /* огибающая пада: перерисовывается только при изменении */
         const Pad *p = &g_pad[g_pu.sel];
         uint32_t h = 2166136261u;
-        int vals[10] = { g_pu.sel, p->a, p->dc, p->s, p->r, p->start, p->n, (int)(uintptr_t)p->d, p->mode, p->loading };
-        for (int i = 0; i < 10; i++) h = sig_add(h, (uint32_t)vals[i]);
+        int vals[11] = { g_pu.sel, p->a, p->dc, p->s, p->r, p->start, p->n, (int)(uintptr_t)p->d, p->mode, p->loading, g_pad_env_sub };
+        for (int i = 0; i < 11; i++) h = sig_add(h, (uint32_t)vals[i]);
         if (h != g_sig_env || g_env_cur < 0) {
             g_sig_env = h;
-            env_render(&g_cv_env, p);
+            env_render(&g_cv_env, p, g_pad_env_sub);
             g_env_cur = g_env_next; g_env_next = (g_env_next + 1) % 2;
             upload_canvas(g_tex_env[g_env_cur], &g_cv_env);
         }
@@ -3476,7 +3537,7 @@ static void ui_update_textures(const UiState *u) {
         if (ch || page != g_last_page || g_page_key != g_last_key || g_ctl_cur < 0) {
             g_last_page = page; g_last_key = g_page_key;
             g_ctl_cur = g_ctl_next; g_ctl_next = (g_ctl_next + 1) % 3;
-            upload_canvas(g_tex_ctl[g_ctl_cur], &g_cv_page[page]);
+            upload_canvas(page == 5 ? g_tex_pctl[g_ctl_cur] : g_tex_ctl[g_ctl_cur], &g_cv_page[page]);
         }
     }
 }
@@ -3648,59 +3709,61 @@ static void trunc_name(char *dst, size_t cap, const char *src, int maxc) {
     if ((int)strlen(dst) > maxc) { dst[maxc - 1] = '.'; dst[maxc] = 0; }
 }
 
-/* экран ЭЛТ на странице PAD: заголовок, волна сэмпла и огибающая с ручками */
+/* маленький осциллограф на странице PAD: заголовок, форма волны, линии воспроизведения звучащих голосов */
 static void draw_pad_crt(const UiState *u) {
     const Pad *p = &g_pad[g_pu.sel];
     char buf[200], nm[48];
     snprintf(buf, sizeof(buf), "PAD %02d", g_pu.sel + 1);
-    text_m(WAVE_X, 90, K_AMBER, 1.5f, buf);
-    if (p->d) { trunc_name(nm, sizeof(nm), p->name, 34); text(WAVE_X + 190, 76, K_AMBER_LT, 0.72f, nm); }
-    else text(WAVE_X + 190, 76, K_AMBER_DIM, 0.72f, "empty - press LOAD to pick a WAV");
+    text_m(ENV_X, 90, K_AMBER, 1.0f, buf);
+    if (p->d) { trunc_name(nm, sizeof(nm), p->name, 26); text(ENV_X + 96, 81, K_AMBER_LT, 0.66f, nm); }
+    else text(ENV_X + 96, 81, K_AMBER_DIM, 0.66f, "empty - press LOAD WAV");
     if (p->d) {
         int tenth = (int)((int64_t)p->n * 10 / (p->rate > 0 ? p->rate : 1));
         snprintf(buf, sizeof(buf), "%d.%d s   %d Hz   %s", tenth / 10, tenth % 10, p->rate, g_pmode_name[p->mode]);
     } else snprintf(buf, sizeof(buf), "%s", g_pmode_name[p->mode]);
-    text(WAVE_X + 190, 91, K_AMBER_DIM, 0.62f, buf);
+    text(ENV_X + 96, 94, K_AMBER_DIM, 0.55f, buf);
     if (g_env_cur >= 0 && g_tex_env[g_env_cur]) vita2d_draw_texture(g_tex_env[g_env_cur], ENV_X, ENV_Y);
-    float px[5], py[5];
-    env_points(p, px, py);
-    text_c(ENV_X + (int)px[1], ENV_Y + (int)py[1] - 14, K_AMBER_LT, 0.55f, "A");
-    text_c(ENV_X + (int)px[2], ENV_Y + (int)py[2] - 14, K_AMBER_LT, 0.55f, "D S");
-    text_c(ENV_X + (int)px[4], ENV_Y + (int)py[4] - 14, K_AMBER_LT, 0.55f, "R");
-    snprintf(buf, sizeof(buf), "ATTACK %d ms    DECAY %d ms    SUSTAIN %d %%    RELEASE %d ms     drag the round handles",
-             (int)pad_ms(p->a), (int)pad_ms(p->dc), p->s, (int)pad_ms(p->r));
-    text(WAVE_X, 312, K_AMBER_DIM, 0.72f, buf);
+    if (p->d && p->n > 1)
+        for (int k = 0; k < PAD_VOICES; k++) {
+            const PVoice *v = &g_pv[k];
+            if (v->stage == 0 || v->pad != g_pu.sel) continue;
+            int x = ENV_X + (int)(v->pos * (double)ENV_W / (double)p->n);
+            if (x >= ENV_X && x < ENV_X + ENV_W) rect(x, ENV_Y, 2, ENV_H, RGBA8(255, 236, 176, 230));
+        }
 }
 
-/* список WAV поверх экрана: стрелки + X, или касание строки */
+/* список WAV поверх нижней правой части: стрелки + X, или касание строки */
 static void draw_pad_list(void) {
-    rect(CRT_X + 4, CRT_Y + 4, CRT_W - 8, CRT_H - 8, RGBA8(22, 14, 8, 252));
-    rect_outline(CRT_X + 4, CRT_Y + 4, CRT_W - 8, CRT_H - 8, 2, K_ORANGE_LO);
+    rect(LST_X, LST_Y, LST_W, LST_H, RGBA8(22, 14, 8, 250));
+    rect_outline(LST_X, LST_Y, LST_W, LST_H, 2, K_ORANGE_LO);
     char buf[120];
-    snprintf(buf, sizeof(buf), "WAV FOR PAD %02d    folder ux0:data/Sampler    (UP/DOWN + X = assign, O = close, drag = scroll)", g_pu.sel + 1);
-    text(CRT_X + 16, CRT_Y + 26, K_YELLOW, 0.68f, buf);
+    snprintf(buf, sizeof(buf), "WAV FOR PAD %02d", g_pu.sel + 1);
+    text(LST_X + 12, LST_Y + 22, K_YELLOW, 0.75f, buf);
+    text(LST_X + 168, LST_Y + 22, K_AMBER_DIM, 0.5f, "UP/DOWN + X = assign   O = close   drag = scroll");
     if (g_pu.list_n == 0) {
-        text(CRT_X + 16, CRT_Y + 70, K_AMBER_LT, 0.8f, "no .wav files yet: record something and press START to save it");
+        text(LST_X + 12, LST_Y + 70, K_AMBER_LT, 0.7f, "no .wav files in ux0:data/Sampler");
+        text(LST_X + 12, LST_Y + 92, K_AMBER_DIM, 0.6f, "record something and press START to save it");
         return;
     }
     for (int i = 0; i < PL_ROWS; i++) {
         int k = g_pu.list_top + i;
         if (k >= g_pu.list_n) break;
-        int y = CRT_Y + 38 + i * 23;
-        if (k == g_pu.list_sel) rect(CRT_X + 12, y, CRT_W - 36, 22, RGBA8(255, 150, 46, 60));
-        text(CRT_X + 20, y + 16, k == g_pu.list_sel ? K_AMBER : K_AMBER_LT, 0.72f, g_pu.list[k]);
+        int y = LST_ROW0 + i * LST_RH;
+        if (k == g_pu.list_sel) rect(LST_X + 6, y, LST_W - 22, LST_RH - 2, RGBA8(255, 150, 46, 60));
+        text(LST_X + 14, y + 18, k == g_pu.list_sel ? K_AMBER : K_AMBER_LT, 0.74f, g_pu.list[k]);
     }
-    int sbh = 200 * PL_ROWS / (g_pu.list_n > PL_ROWS ? g_pu.list_n : PL_ROWS);
-    int sby = CRT_Y + 38 + (g_pu.list_n > PL_ROWS ? (200 - sbh) * g_pu.list_top / (g_pu.list_n - PL_ROWS) : 0);
-    rect(CRT_X + CRT_W - 18, CRT_Y + 38, 3, 230, RGBA8(255, 150, 46, 30));
-    rect(CRT_X + CRT_W - 19, sby, 5, sbh, RGBA8(255, 170, 70, 200));
+    int track = PL_ROWS * LST_RH;
+    int sbh = track * PL_ROWS / (g_pu.list_n > PL_ROWS ? g_pu.list_n : PL_ROWS);
+    int sby = LST_ROW0 + (g_pu.list_n > PL_ROWS ? (track - sbh) * g_pu.list_top / (g_pu.list_n - PL_ROWS) : 0);
+    rect(LST_X + LST_W - 12, LST_ROW0, 3, track, RGBA8(255, 150, 46, 30));
+    rect(LST_X + LST_W - 13, sby, 5, sbh, RGBA8(255, 170, 70, 200));
 }
 
 static void ui_draw(const UiState *u) {
     char buf[200], t1[32];
     static const char *page_name[6] = { "EDIT", "SLICE", "GRAIN", "ADV", "FX", "PAD" };
 
-    vita2d_draw_texture(g_tex_bg, 0, 0);
+    vita2d_draw_texture(u->page == 5 ? g_tex_bgpad : g_tex_bg, 0, 0);
     if (g_top_cur >= 0) vita2d_draw_texture(g_tex_top[g_top_cur], 0, 0);
 
     /* верхняя планка */
@@ -3780,9 +3843,8 @@ static void ui_draw(const UiState *u) {
         text(WAVE_X + WAVE_W - 150, 312, K_AMBER, 0.72f, buf);
     }
     }
-    text(WAVE_X, 329, u->confirm ? K_YELLOW : K_AMBER_LT, 0.82f, u->msg);
-
-    if (u->page == 5 && g_pu.list_open) draw_pad_list();
+    if (u->page == 5) text(PBZ_X + 4, 226, u->confirm ? K_YELLOW : K_BROWN, 0.66f, u->msg);
+    else text(WAVE_X, 329, u->confirm ? K_YELLOW : K_AMBER_LT, 0.82f, u->msg);
 
     /* справка поверх экрана */
     if (u->legend) {
@@ -3806,7 +3868,8 @@ static void ui_draw(const UiState *u) {
     }
 
     /* стекло перед ЭЛТ */
-    if (g_tex_glass) vita2d_draw_texture(g_tex_glass, CRT_X - GL_M, CRT_Y - GL_M);
+    if (u->page == 5) { if (g_tex_glass2) vita2d_draw_texture(g_tex_glass2, PCRT_X - GL_M, PCRT_Y - GL_M); }
+    else if (g_tex_glass) vita2d_draw_texture(g_tex_glass, CRT_X - GL_M, CRT_Y - GL_M);
 
     /* индикатор уровня: сплошной градиент в стеклянной трубке, пик, засечки, окна */
     {
@@ -3838,7 +3901,10 @@ static void ui_draw(const UiState *u) {
     }
 
     /* органы управления */
-    if (g_ctl_cur >= 0) vita2d_draw_texture(g_tex_ctl[g_ctl_cur], 0, CTL_TY);
+    if (g_ctl_cur >= 0) {
+        if (u->page == 5) vita2d_draw_texture(g_tex_pctl[g_ctl_cur], 0, PAD_CY);
+        else vita2d_draw_texture(g_tex_ctl[g_ctl_cur], 0, CTL_TY);
+    }
     char v[48];
     for (int k = 0; k < N_KNOBS; k++) {
         if (!knob_visible(k, u->page, u->fx_sec)) continue;
@@ -3889,18 +3955,31 @@ static void ui_draw(const UiState *u) {
             int sl = (g_pu.sel == i), pr = sl || ((g_pu.down_mask >> i) & 1), off = pr ? 2 : 0;
             char nb[8], nm[24];
             snprintf(nb, sizeof(nb), "%d", i + 1);
-            text(x + 7, y + 14 + off, sl ? K_CREAM_HI : K_BROWN, 0.6f, nb);
+            text(x + 13, y + 29 + off, sl ? K_CREAM_HI : K_BROWN, 0.95f, nb);
             if (g_pad[i].d) {
-                trunc_name(nm, sizeof(nm), g_pad[i].name, 11);
-                text(x + 7, y + 27 + off, sl ? K_CREAM_HI : K_BROWN_LO, 0.5f, nm);
+                trunc_name(nm, sizeof(nm), g_pad[i].name, 15);
+                text_c(x + w / 2, y + h - 16 + off, sl ? K_CREAM_HI : K_BROWN, 0.55f, nm);
+            } else text_c(x + w / 2, y + h - 16 + off, sl ? K_CREAM_HI : K_BROWN_LO, 0.55f, "empty");
+        }
+        static const char *bl[4] = { "LOAD WAV", NULL, "ADSR", "CLEAR PAD" };
+        static const char *bs[4] = { "pick a file for this pad", NULL, "attack decay sustain release", "remove the sample" };
+        static const int bid[4] = { B_PLOAD, B_PMODE, B_PENV, B_PCLR };
+        for (int k = 0; k < 4; k++) {
+            int x, y, w, h;
+            btn_geom(bid[k], &x, &y, &w, &h);
+            int on = (k == 0 && g_pu.list_open) || (k == 2 && g_pad_env_sub);
+            int off = ((u->btn_down == bid[k]) || on) ? 2 : 0;
+            if (k == 1) {
+                text_c(x + w / 2, y + 28 + off, K_BROWN_LO, 0.55f, "MODE");
+                text_c(x + w / 2, y + 47 + off, K_BROWN, 0.82f, g_pmode_name[g_pad[g_pu.sel].mode]);
+            } else {
+                const char *t = (k == 2 && g_pad_env_sub) ? "BACK" : bl[k];
+                text_c(x + w / 2, y + 30 + off, K_BROWN, 0.82f, t);
+                text_c(x + w / 2, y + 48 + off, K_BROWN_LO, 0.5f, (k == 2 && g_pad_env_sub) ? "to volume / pitch / start" : bs[k]);
             }
         }
-        int lp = (u->btn_down == B_PLOAD) || g_pu.list_open, mp = (u->btn_down == B_PMODE);
-        text_c(864, 410 + (lp ? 2 : 0), K_BROWN, 0.75f, "LOAD WAV");
-        text_c(864, 427 + (lp ? 2 : 0), K_BROWN_LO, 0.5f, "pick a file for this pad");
-        text_c(864, 480 + (mp ? 2 : 0), K_BROWN_LO, 0.55f, "MODE");
-        text_c(864, 500 + (mp ? 2 : 0), K_BROWN, 0.78f, g_pmode_name[g_pad[g_pu.sel].mode]);
-        text(316, 530, K_BROWN_LO, 0.5f, "pad = touch or X     D-pad = select pad     ENVELOPE: drag the handles on the screen");
+        text(494, 539 - 3, K_BROWN_LO, 0.5f, "pads: touch or X     D-pad: select     SELECT+arrows: tabs");
+        if (g_pu.list_open) draw_pad_list();
     } else if (u->page == 2) {
         text_c(885, 461 + (((u->btn_down == B_GR_ON) || u->gr_on) ? 2 : 0), K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
         text_c(885, 504, K_BROWN, 0.55f, "same pitch and speed,");
@@ -4701,6 +4780,8 @@ static void perform_hit(int hit) {
         g_flt_type = hit - B_FT0;
         snprintf(msg, sizeof(msg), "%s", nm[g_flt_type]);
     }
+    else if (hit == B_PENV) { g_pad_env_sub = !g_pad_env_sub; A.knob_on = 0; snprintf(msg, sizeof(msg), g_pad_env_sub ? "ADSR: shape the volume of this pad" : "Volume / pitch / start"); }
+    else if (hit == B_PCLR) { pad_clear(g_pu.sel); pad_mark_dirty(); snprintf(msg, sizeof(msg), "Pad %d cleared", g_pu.sel + 1); }
     else if (hit == B_PLOAD) { if (g_pu.list_open) g_pu.list_open = 0; else pad_list_open(); }
     else if (hit == B_PMODE) {
         Pad *p = &g_pad[g_pu.sel];
@@ -5163,19 +5244,14 @@ int main(void) {
             double fx = touch.report[k].x / 2.0, fy = touch.report[k].y / 2.0;
             int in_wave = (A.page != 5 && fx >= WAVE_X - 4 && fx <= WAVE_X + WAVE_W + 4 && fy >= WAVE_Y - 18 && fy <= WAVE_Y + WAVE_H + 18);
 
-            if (A.page == 5) {                                    /* PAD: список WAV, ручки огибающей, пады */
-                if (g_pu.list_open && fx >= CRT_X && fx < CRT_X + CRT_W && fy >= CRT_Y && fy < CRT_Y + CRT_H) {
+            if (A.page == 5) {                                    /* PAD: список WAV и пады */
+                if (g_pu.list_open && fx >= LST_X && fx < LST_X + LST_W && fy >= LST_Y && fy < LST_Y + LST_H) {
                     if (!A.ls_on) { A.ls_on = 1; A.ls_id = id; A.ls_y0 = fy; A.ls_moved = 0; A.ls_top0 = g_pu.list_top; }
                     continue;
-                }
-                if (!A.ph_on && !g_pu.list_open && fx >= ENV_X - 12 && fx <= ENV_X + ENV_W + 12 && fy >= ENV_Y - 14 && fy <= ENV_Y + ENV_H + 8) {
-                    int pk = env_pick((float)fx, (float)fy);
-                    if (pk >= 0) { A.ph_on = 1; A.ph_id = id; A.ph_k = pk; env_drag(pk, (float)fx, (float)fy); continue; }
                 }
                 int ph = hit_test((int)fx, (int)fy, A.page, A.fx_sec, g_sl_n);
                 if (ph >= B_PAD0) { pad_press(id, ph - B_PAD0); continue; }
             }
-
             if (in_wave && g_mode == 1 && A.page != 2 && !A.sdrag_on && !A.scrubbing && g_state != ST_RECORDING
                 && length > 1 && fy < WAVE_Y + 46) {
                 int bi2 = -1, bsg = 0; double bd2 = 28.0;
@@ -5326,7 +5402,7 @@ int main(void) {
         }
 
         /* уже идущие касания */
-        int ph_alive = 0, ls_alive = 0, scrub_alive = 0, knob_alive = 0, curve_alive = 0, btn_alive = 0, sdrag_alive = 0, drag_alive[3] = { 0, 0, 0 };
+        int ls_alive = 0, scrub_alive = 0, knob_alive = 0, curve_alive = 0, btn_alive = 0, sdrag_alive = 0, drag_alive[3] = { 0, 0, 0 };
         for (int k = 0; k < nrep; k++) {
             int id = touch.report[k].id;
             double fx = touch.report[k].x / 2.0;
@@ -5400,13 +5476,12 @@ int main(void) {
                 knob_set(A.knob_k, nv);
                 if (fabs(fx - A.knob_x0) + fabs(fy2 - A.knob_y0) > 8.0) A.knob_last_k = -1;   /* перетаскивание - не двойное касание */
             }
-            if (A.ph_on && id == A.ph_id) { ph_alive = 1; env_drag(A.ph_k, (float)fx, (float)(touch.report[k].y / 2.0)); }
             if (A.ls_on && id == A.ls_id) {
                 ls_alive = 1;
                 double dy = touch.report[k].y / 2.0 - A.ls_y0;
                 if (fabs(dy) > 8.0) A.ls_moved = 1;
                 if (A.ls_moved) {
-                    int top = A.ls_top0 - (int)floor(dy / 23.0 + 0.5);
+                    int top = A.ls_top0 - (int)floor(dy / (double)LST_RH + 0.5);
                     int mx = g_pu.list_n - PL_ROWS; if (mx < 0) mx = 0;
                     g_pu.list_top = top < 0 ? 0 : (top > mx ? mx : top);
                 }
@@ -5455,12 +5530,11 @@ int main(void) {
             dbg_log("scrub end %d", endpos);
         }
         if (A.sdrag_on && !sdrag_alive) A.sdrag_on = 0;
-        if (A.ph_on && !ph_alive) A.ph_on = 0;
         if (A.ls_on && !ls_alive) {                              /* список: короткое касание без прокрутки = выбрать строку */
             A.ls_on = 0;
             if (!A.ls_moved && g_pu.list_open) {
-                int row = (int)((A.ls_y0 - (CRT_Y + 38)) / 23.0);
-                if (A.ls_y0 >= CRT_Y + 38 && row >= 0 && row < PL_ROWS && g_pu.list_top + row < g_pu.list_n) {
+                int row = (int)((A.ls_y0 - LST_ROW0) / (double)LST_RH);
+                if (A.ls_y0 >= LST_ROW0 && row >= 0 && row < PL_ROWS && g_pu.list_top + row < g_pu.list_n) {
                     g_pu.list_sel = g_pu.list_top + row;
                     pad_assign(g_pu.list_sel);
                 }
