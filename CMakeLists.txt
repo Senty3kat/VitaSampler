@@ -49,14 +49,9 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   NAME ${VITA_APP_NAME}
   FILE ${CMAKE_SOURCE_DIR}/fonts/DejaVuSansCondensed-Bold.ttf fonts/cond.ttf
   FILE ${CMAKE_SOURCE_DIR}/fonts/DejaVuSansMono-Bold.ttf fonts/mono.ttf
+  FILE ${CMAKE_SOURCE_DIR}/assets/skin_0.png assets/skin_0.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/skin_1.png assets/skin_1.png
   FILE ${CMAKE_SOURCE_DIR}/fonts/pix9.ttf fonts/pix9.ttf
   FILE ${CMAKE_SOURCE_DIR}/fonts/pix11.ttf fonts/pix11.ttf
   FILE ${CMAKE_SOURCE_DIR}/fonts/pix13.ttf fonts/pix13.ttf
-  FILE ${CMAKE_SOURCE_DIR}/assets/knobs.png assets/knobs.png
-  FILE ${CMAKE_SOURCE_DIR}/assets/keys.png assets/keys.png
-  FILE ${CMAKE_SOURCE_DIR}/assets/lamps.png assets/lamps.png
-  FILE ${CMAKE_SOURCE_DIR}/assets/body.png assets/body.png
-  FILE ${CMAKE_SOURCE_DIR}/assets/t1_body.png assets/t1_body.png
-  FILE ${CMAKE_SOURCE_DIR}/assets/t1_keys.png assets/t1_keys.png
-  FILE ${CMAKE_SOURCE_DIR}/assets/t1_lamps.png assets/t1_lamps.png
 )

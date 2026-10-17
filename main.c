@@ -1,5 +1,5 @@
 /*
- * Vita Sampler v2.0
+ * Vita Sampler v2.1
  *
  * Кнопки: R запись/стоп, L пауза/play (удержание L = глитч, задняя панель: палец вверх/вниз = 1-30 Гц),
  *   Треугольник стоп, Квадрат петля, Круг страница FX, START сохранить WAV, SELECT справка,
@@ -2505,19 +2505,34 @@ static int img_load(Img *im, const char *name) {
     im->px = buf; im->w = (int)pi.width; im->h = (int)pi.height;
     return 1;
 }
-/* спрайты темы: если есть готовый tN_<имя>.png - берём его, иначе общий лист, перекрашенный th_map */
+/* Скин - ОДНА большая текстура assets/skin_<тема>.png (1280x640), детали разложены с зазорами (схема - assets/skin_guide.png,
+   сборка - tools/pack_skin.py). Раскладка должна совпадать с LAYOUT в tools/pack_skin.py. */
+#define SKIN_W 1280
+#define SKIN_H 640
+static void img_cut(Img *dst, const Img *atlas, int x, int y, int w, int h) {
+    memset(dst, 0, sizeof(Img));
+    if (!atlas->px || x + w > atlas->w || y + h > atlas->h) return;
+    uint32_t *p = (uint32_t *)malloc((size_t)w * h * 4);
+    if (!p) return;
+    for (int j = 0; j < h; j++) memcpy(p + (size_t)j * w, atlas->px + (size_t)(y + j) * atlas->w + x, (size_t)w * 4);
+    dst->px = p; dst->w = w; dst->h = h;
+}
 static void assets_init(void) {
     Img *all[4] = { &g_img_knobs, &g_img_keys, &g_img_lamps, &g_img_body };
-    static const char *nm[4] = { "knobs.png", "keys.png", "lamps.png", "body.png" };
-    for (int i = 0; i < 4; i++) {
-        free(all[i]->px);
-        memset(all[i], 0, sizeof(Img));
-        char alt[48];
-        snprintf(alt, sizeof alt, "t%d_%s", g_theme, nm[i]);
-        if (g_theme > 0 && img_load(all[i], alt)) continue;
-        if (img_load(all[i], nm[i]) && g_theme > 0 && i != 2)      /* лампочки (красная, зелёная, янтарная) цвет сохраняют */
-            for (int k = 0; k < all[i]->w * all[i]->h; k++) all[i]->px[k] = th_map(all[i]->px[k]);
-    }
+    for (int i = 0; i < 4; i++) { free(all[i]->px); memset(all[i], 0, sizeof(Img)); }
+    Img at; memset(&at, 0, sizeof at);
+    char nm[32];
+    snprintf(nm, sizeof nm, "skin_%d.png", g_theme);
+    if (!img_load(&at, nm) && g_theme > 0) img_load(&at, "skin_0.png");
+    if (!at.px) return;
+    img_cut(&g_img_body,  &at,   0,   0, 960, 544);
+    img_cut(&g_img_knobs, &at, 976,   0, 264, 352);
+    img_cut(&g_img_keys,  &at, 976, 368, 208, 104);
+    img_cut(&g_img_lamps, &at, 976, 488, 240,  40);
+    free(at.px);
+    /* ручки в других темах перекрашиваются тем же th_map (остальные детали в атласе уже нарисованы под тему) */
+    if (g_theme > 0 && g_img_knobs.px)
+        for (int k = 0; k < g_img_knobs.w * g_img_knobs.h; k++) g_img_knobs.px[k] = th_map(g_img_knobs.px[k]);
 }
 
 static inline float fclampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -4266,7 +4281,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя планка */
     text(50, 22, K_BROWN, 1.1f, "VITA SAMPLER");
-    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v2.0");
+    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v2.1");
     text(560, 26, K_BROWN, 0.62f, "REC");
     text(648, 26, K_BROWN, 0.62f, "PLAY");
     text(736, 26, K_BROWN, 0.62f, "LOOP");
@@ -4386,7 +4401,7 @@ static void ui_draw(const UiState *u) {
             if (on) text_r(x + w - 18, y + 38, K_YELLOW, 0.72f, "ACTIVE");
         }
         char b2[80];
-        snprintf(b2, sizeof(b2), "Vita Sampler v2.0     audio load %d.%d %%", g_out_load / 10, g_out_load % 10);
+        snprintf(b2, sizeof(b2), "Vita Sampler v2.1     audio load %d.%d %%", g_out_load / 10, g_out_load % 10);
         text(CRT_X + 16, CRT_Y + CRT_H - 20, K_AMBER_DIM, 0.6f, b2);
     }
 
@@ -5380,7 +5395,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v2.0");
+    dbg_log("start v2.1");
     scePowerSetArmClockFrequency(444);              /* максимум: больше запаса для звука и отрисовки */
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);

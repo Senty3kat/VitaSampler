@@ -118,3 +118,11 @@
 - Aqua по образцу Winamp: экран тёмно-синий, графика и текст светло-голубые (`g_scr=1` → `th_screen`; красный/зелёный на экране сохраняются). `RGBA8T` — цвет через `th_map`.
 - Пиксельный режим (theme 1): `pix_apply` (блоки 2×2, дизер Байера, step=16) на холстах, `pix_outline` (тёмная обводка) в `upload_canvas` для страниц, пиксельные шрифты `fonts/pix9/11/13.ttf` (`pf_pick`, генератор `tools/gen_pixfont.py`).
 - Свои спрайты темы: `assets/t1_body.png` (`tools/gen_theme_aqua.py`), `t1_keys.png`, `t1_lamps.png` (`tools/gen_theme_aqua_sprites.py`; раскладка как у keys/lamps). `assets_init` берёт `t<theme>_<имя>`, иначе общий лист + `th_map`. Красная клавиша (стиль 2) пока процедурная.
+
+## v2.1 (скин = одна большая текстура)
+
+- Все PNG темы лежат в ОДНОМ атласе `assets/skin_<тема>.png` (1280×640, как скин Minecraft): body (0,0,960×544), knobs (976,0,264×352), keys (976,368,208×104), lamps (976,488,240×40); свободное место справа внизу.
+  Схема с подписями — `assets/skin_guide.png`. Сборка: `python3 tools/pack_skin.py` (из body/knobs/keys/lamps.png и t1_*.png; те остаются исходниками). `assets_init` грузит атлас и режет на `Img` (`img_cut`);
+  раскладка в `main.c` и `LAYOUT` в pack_skin.py должна совпадать. В VPK лежат только skin_0/skin_1. Ручки в теме>0 перекрашиваются `th_map` при загрузке.
+- Aqua: корпус «прозрачный» — `tools/gen_theme_aqua.py` рисует под пластиком плату (дорожки, микросхемы, конденсаторы), размывает и подмешивает 27–58 % (в панели слабее, чтобы читались подписи).
+  После правки body/t1_* пересобрать: gen_theme_aqua.py → gen_theme_aqua_sprites.py → pack_skin.py.
