@@ -938,16 +938,6 @@ static void pad_mix_add(int16_t *mono, int *peak) {
                 v->stage = 4; v->rel = v->env / (rem > 1.0f ? rem : 1.0f);
             }
             float xs = smp * v->env;
-            if (comp_on) {                                                  /* компрессор пада: следящая огибающая, усиление каждые 16 отсчётов */
-                float lv = fabsf(xs) * (1.0f / 32768.0f);
-                v->cenv += (lv > v->cenv ? 0.0042f : 0.0002f) * (lv - v->cenv);
-                if ((i & 15) == 0) {
-                    float tg = 1.0f;
-                    if (v->cenv > cthr) tg = expf(-logf(v->cenv / cthr) * cslope);       /* (log2f / exp2f в newlib vitasdk нет - это тот же расчёт через logf / expf) */
-                    v->cg += (tg - v->cg) * 0.3f;
-                }
-                xs = xs * (1.0f - cmix) + xs * v->cg * cmake * cmix;
-            }
             acc[i] += xs * gain;
             v->pos += (double)step;
         }
