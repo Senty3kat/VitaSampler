@@ -63,3 +63,10 @@
   (FILE-записи в CMakeLists). В `main.c`: `assets_init` (libpng simplified API), `cv_blit/cv_blit_rot/cv_blit9`;
   `cv_knob/cv_key/cv_lamp` используют спрайты, а если файла нет — старая процедурная отрисовка. Красная клавиша (стиль 2) пока процедурная.
 - Хост: `ASSET_PREFIX="../assets/"` в `host/Makefile`. Следующие этапы: фон/корпус/панель, цифры, трубка уровня.
+
+## design/ — детали для художника
+- `design/` — отдельные PNG всех деталей (knobs, keys, lamps, background, parts) + README с размерами и координатами. Из листов `assets/*.png`
+  режет `tools/export_design.py`, обратно собирает `tools/pack_assets.py`; процедурные детали (`parts/`) выгружает `make -C host export`.
+- `parts/` пока только образцы: загрузчики для них добавляются, когда придут новые картинки.
+- Идеи автора (не начаты): режим PAD/MPC 4×4 с WAV из папки + ADSR и модификаторы; мини-клавиатура 1–2 октавы в GRAIN (амбиент-синт);
+  выбор имени при сохранении WAV.
