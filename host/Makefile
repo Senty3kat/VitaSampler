@@ -9,3 +9,6 @@ export: export_design.c ../main.c
 	mkdir -p ../design/parts
 	gcc $(CFLAGS) -w export_design.c -o export_design.bin -lm -lpng -Wl,--unresolved-symbols=ignore-all
 	./export_design.bin ../design/parts
+	mkdir -p /tmp/parts_0 /tmp/parts_1
+	./export_design.bin /tmp/parts_0 0 > /dev/null
+	./export_design.bin /tmp/parts_1 1 > /dev/null

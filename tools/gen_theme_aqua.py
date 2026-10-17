@@ -95,3 +95,8 @@ img[..., :3] = img[..., :3] * (1 - sheen[..., None]) + sheen[..., None]
 img[..., :3] = img[..., :3].clip(0, 1)
 Image.fromarray((img * 255 + 0.5).astype(np.uint8), "RGBA").save(os.path.join(HERE, "..", "assets", "t1_body.png"))
 print("t1_body.png")
+
+# ручки Aqua: тот же перекрас, что был в коде (теперь запечён в картинку, в игре перекраски нет)
+kn = np.asarray(Image.open(os.path.join(HERE, "..", "assets", "knobs.png")).convert("RGBA"), np.float32) / 255.0
+Image.fromarray((th_map(kn) * 255 + 0.5).astype(np.uint8), "RGBA").save(os.path.join(HERE, "..", "assets", "t1_knobs.png"))
+print("t1_knobs.png")

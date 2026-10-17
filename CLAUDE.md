@@ -123,6 +123,8 @@
 
 - Все PNG темы лежат в ОДНОМ атласе `assets/skin_<тема>.png` (1280×640, как скин Minecraft): body (0,0,960×544), knobs (976,0,264×352), keys (976,368,208×104), lamps (976,488,240×40); свободное место справа внизу.
   Схема с подписями — `assets/skin_guide.png`. Сборка: `python3 tools/pack_skin.py` (из body/knobs/keys/lamps.png и t1_*.png; те остаются исходниками). `assets_init` грузит атлас и режет на `Img` (`img_cut`);
-  раскладка в `main.c` и `LAYOUT` в pack_skin.py должна совпадать. В VPK лежат только skin_0/skin_1. Ручки в теме>0 перекрашиваются `th_map` при загрузке.
+  раскладка в `main.c` и `LAYOUT` в pack_skin.py должна совпадать. В VPK лежат только skin_0/skin_1. Ручки Aqua запечены в `t1_knobs.png` (перекраска в `gen_theme_aqua.py`), в коде перекраски нет.
 - Aqua: корпус «прозрачный» — `tools/gen_theme_aqua.py` рисует под пластиком плату (дорожки, микросхемы, конденсаторы), размывает и подмешивает 27–58 % (в панели слабее, чтобы читались подписи).
   После правки body/t1_* пересобрать: gen_theme_aqua.py → gen_theme_aqua_sprites.py → pack_skin.py.
+- Листы-схемы для художника: `assets/skin_sheet_classic.png` и `skin_sheet_aqua.png` (`tools/make_skin_sheet.py`, перед ним `make -C host preview && make -C host export`): атлас с подписями в полях, детали, которые рисует код
+  (`/tmp/parts_N`, `export_design.bin <папка> <тема>`), и общий вид всех экранов темы. Старый `skin_guide.png` оставлен как схема координат атласа.

@@ -2530,9 +2530,6 @@ static void assets_init(void) {
     img_cut(&g_img_keys,  &at, 976, 368, 208, 104);
     img_cut(&g_img_lamps, &at, 976, 488, 240,  40);
     free(at.px);
-    /* ручки в других темах перекрашиваются тем же th_map (остальные детали в атласе уже нарисованы под тему) */
-    if (g_theme > 0 && g_img_knobs.px)
-        for (int k = 0; k < g_img_knobs.w * g_img_knobs.h; k++) g_img_knobs.px[k] = th_map(g_img_knobs.px[k]);
 }
 
 static inline float fclampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }

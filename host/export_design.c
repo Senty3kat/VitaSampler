@@ -24,6 +24,7 @@ static void punch(Canvas *c, float x, float y, float w, float h, float r) {
 
 int main(int argc, char **argv) {
     if (argc > 1) g_out = argv[1];
+    if (argc > 2) g_theme = atoi(argv[2]);        /* тема: 0 Classic, 1 Aqua (детали рисуются в цветах темы) */
     /* оранжевая рамка экрана (окно ЭЛТ прозрачное) */
     { Canvas c = mk(BEZ_W, BEZ_H);
       cv_rrect_grad(&c, 0, 0, BEZ_W, BEZ_H, 10, RGBA8(232, 124, 34, 255), RGBA8(150, 62, 10, 255));

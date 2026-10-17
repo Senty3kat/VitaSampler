@@ -11,4 +11,11 @@ for name, page, mode, sec, leg, *st in shots:
 for name, page, mode, sec, leg, sc, th, *ss in themed:
     subprocess.run(["./preview.bin", "/tmp/frame.raw", str(page), str(mode), str(sec), str(leg), str(sc), str(th), str(ss[0] if ss else 0)], check=True)
     Image.frombuffer("RGBA", (960, 544), open("/tmp/frame.raw", "rb").read(), "raw", "RGBA", 0, 1).convert("RGB").save(f"/tmp/shots/{name}.png")
+# все экраны обеих тем для листа скина (tools/make_skin_sheet.py): /tmp/shots/sheet_<тема>_<имя>.png
+for th in (0, 1):
+    for name, page, mode, sec, leg, *st in shots:
+        subprocess.run(["./preview.bin", "/tmp/frame.raw", str(page), str(mode), str(sec), str(leg), str(st[0] if st else 0), str(th), "0"], check=True)
+        Image.frombuffer("RGBA", (960, 544), open("/tmp/frame.raw", "rb").read(), "raw", "RGBA", 0, 1).convert("RGB").save(f"/tmp/shots/sheet_{th}_{name}.png")
+    subprocess.run(["./preview.bin", "/tmp/frame.raw", "0", "0", "0", "0", "0", str(th), "1"], check=True)
+    Image.frombuffer("RGBA", (960, 544), open("/tmp/frame.raw", "rb").read(), "raw", "RGBA", 0, 1).convert("RGB").save(f"/tmp/shots/sheet_{th}_settings.png")
 print("ok")
