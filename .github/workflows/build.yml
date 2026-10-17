@@ -1,5 +1,8 @@
 name: Build VPK
 
+permissions:
+  contents: write
+
 on:
   push:
   workflow_dispatch:
@@ -18,3 +21,12 @@ jobs:
         with:
           name: Sampler-vpk
           path: build/Sampler.vpk
+      - name: Publish latest release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cp build/Sampler.vpk Sampler.vpk
+          gh release delete latest --cleanup-tag --yes -R "$GITHUB_REPOSITORY" || true
+          gh release create latest Sampler.vpk -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Latest build" --notes "Автосборка из main: $GITHUB_SHA"
