@@ -31,6 +31,7 @@ target_link_libraries(${PROJECT_NAME}
   SceAudio_stub
   SceAudioIn_stub
   SceCommonDialog_stub
+  ScePower_stub
   ScePgf_stub
   ScePvf_stub
   freetype

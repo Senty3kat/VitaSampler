@@ -136,6 +136,8 @@ int main(int argc, char **argv) {
     scene(&u, page, mode, ST_PLAYING);
     u.fx_sec = fxsec; u.legend = legend;
     if (mode == 1) { for (int i = 0; i <= 8; i++) g_sl_pos[i] = len * i / 8; g_sl_n = 8; u.sl_n = 8; }
+    u.kb_note = (sc == 6) ? 16 : -1;                          /* sc 6: на клавиатуре GRAIN нажата клавиша E (+4 пт) */
+    if (sc == 6) { g_kb_on = 1; g_kb_semi = 4; }
     if (sc == 1) { u.length = 0; u.playhead = 0; u.state = ST_IDLE; u.loop = 0; compute_layout(&u.lay, 0, 0, 0, 0, 0); }
     if (sc == 2) { u.live = 1; u.state = ST_RECORDING; compute_layout(&u.lay, len, 1, 0, 0, 0); snprintf(u.msg, sizeof(u.msg), "Recording..."); u.clip = 30; }
     render_wave(g_wave_tex[0], &u.lay, sc == 1 ? 0 : len, u.live);

@@ -1,5 +1,5 @@
 /*
- * Vita Sampler v1.5
+ * Vita Sampler v1.6
  *
  * Кнопки: R запись/стоп, L пауза/play (удержание L = глитч, задняя панель: палец вверх/вниз = 1-30 Гц),
  *   Треугольник стоп, Квадрат петля, Круг страница FX, START сохранить WAV, SELECT справка,
@@ -17,6 +17,7 @@
 #include <math.h>
 
 #include <psp2/kernel/processmgr.h>
+#include <psp2/power.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/audioin.h>
 #include <psp2/audioout.h>
@@ -190,6 +191,7 @@ static volatile int g_loop = 0;
 /* фильтр (2-й порядок, без резонанса): тип 0 выкл, 1 LPF, 2 HPF, 3 BPF; центр и ширина - ползунки 0..100 */
 static volatile int g_flt_type = 0, g_flt_c = 60, g_flt_w = 50;
 /* гранулярный эффект: вкл, смесь %, число зёрен (индекс 0..15 -> 1..16), длина, разброс (ползунки 0..100) */
+static volatile int g_kb_on = 0, g_kb_semi = 0;      /* клавиатура GRAIN: зажата ли клавиша и сдвиг тона в полутонах (-12..+12) */
 static volatile int g_gr_on = 0, g_gr_mix = 70, g_gr_n = 7, g_gr_size = 48, g_gr_spr = 40, g_gr_det = 0;
 static volatile int g_lo = 0;
 static volatile int g_hi = 0;
@@ -200,6 +202,7 @@ static volatile int g_reset_out = 0;
 static volatile int g_in_late = 0;              /* диагностика микрофона: опоздавшие блоки */
 static volatile int g_in_odd = 0;               /* диагностика микрофона: необычные коды возврата */
 static volatile int g_in_r0 = -999;
+static volatile int g_out_load = 0;              /* нагрузка вывода: время расчёта блока / длительность блока, ‰ (пик за ~1.5 с) */
 static volatile int g_out_late = 0;             /* диагностика вывода: опоздавшие блоки */
 
 /* режимы: 0 = EDIT (курсоры A/B), 1 = SLICE (авто-нарезка на регионы) */
@@ -725,8 +728,14 @@ static void load_params(Params *p, int lo, int hi) {
     float tm = (g_mode == 1) ? g_tempo_mul : 1.0f;                /* BPM-регулятор работает в SLICE */
     p->speed = speed_from_idx(fs) * tm;
     p->glitch_hz = g_glitch_hz;
-    p->pratio = powf(2.0f, ((float)(fp - 24) + (float)(fc - 50) / 100.0f) / 12.0f);
-    p->neutral = (fs == FX_SPEED_DEF && fp == 24 && fc == 50 && fabsf(tm - 1.0f) < 1e-4f);
+    static float kb_cur = 0.0f;                                    /* плавный переход (глиссандо) между клавишами */
+    {
+        float tg = g_kb_on ? (float)g_kb_semi : 0.0f;
+        kb_cur += (tg - kb_cur) * 0.45f;
+        if (fabsf(tg - kb_cur) < 0.02f) kb_cur = tg;
+    }
+    p->pratio = powf(2.0f, ((float)(fp - 24) + (float)(fc - 50) / 100.0f + kb_cur) / 12.0f);
+    p->neutral = (fs == FX_SPEED_DEF && fp == 24 && fc == 50 && fabsf(tm - 1.0f) < 1e-4f && kb_cur == 0.0f);
     p->volume = (float)g_fx[5] / 100.0f;
     p->lo = lo;
     p->hi = hi;
@@ -848,11 +857,13 @@ static volatile int g_pe_vol = 80, g_pe_pitch = 24, g_pe_start = 0;   /* зна�
 static volatile int g_pe_a = 0, g_pe_dc = 30, g_pe_s = 100, g_pe_r = 10;
 static volatile int g_pe_cth = 100, g_pe_crat = 40, g_pe_cmk = 0, g_pe_cmx = 100;
 static int g_pad_env_sub = 0;                      /* подстраница PAD: 0 основная, 1 огибающая ADSR */
-typedef struct { int pad, stage, gate; double pos; float env, rel, cenv, cg; } PVoice;   /* stage: 0 пусто, 1 A, 2 D, 3 S, 4 R */
+typedef struct { int pad, stage, gate; unsigned age; double pos; float env, rel, cenv, cg; } PVoice;   /* stage: 0 пусто, 1 A, 2 D, 3 S, 4 R */
 static PVoice g_pv[PAD_VOICES];
 static volatile unsigned g_pad_trig[PAD_N], g_pad_rel[PAD_N];
 static volatile int g_pad_mask;                    /* биты пэдов, у которых сейчас звучит голос (для индикации) */
 static unsigned g_pad_seen_t[PAD_N], g_pad_seen_r[PAD_N];
+static unsigned g_pv_age = 0;                       /* счётчик ударов: по нему находим самый старый голос */
+#define PAD_LAYERS 4                                /* ONE-SHOT: столько ударов одного пада звучат одновременно */
 
 /* Запас в сегменте кода: vita-elf-create дописывает в конец сегмента 0 таблицы импорта (~2.8 КБ); если код заканчивается
  * почти у границы страницы, сборка падает с "Cannot allocate ... segment 1 overlaps". Тогда меняем TEXT_PAD (на 1-2 КБ). */
@@ -862,16 +873,30 @@ static void __attribute__((used, noinline)) text_pad(void) { __asm__ volatile(".
 static float pad_ms(int v) { float t = (float)v / 100.0f; return 3000.0f * t * t; }
 static void pad_defaults(Pad *p) { p->vol = 80; p->pitch = 24; p->start = 0; p->mode = 0; p->a = 0; p->dc = 30; p->s = 100; p->r = 10; p->cth = 100; p->crat = 40; p->cmk = 0; p->cmx = 100; }
 
+static void pv_fade(PVoice *v) {                    /* быстро (5 мс) погасить голос, без щелчка */
+    if (v->stage == 0 || v->stage == 4) return;
+    v->stage = 4; v->rel = v->env / 240.0f + 1e-6f;
+}
 static void pad_voice_trigger(int i) {
     Pad *p = &g_pad[i];
     if (!p->d || p->loading || p->n < 2) return;
-    for (int k = 0; k < PAD_VOICES; k++)                                   /* повторный удар: старый голос быстро (5 мс) гаснет */
-        if (g_pv[k].pad == i && g_pv[k].stage != 0 && g_pv[k].stage != 4) { g_pv[k].stage = 4; g_pv[k].rel = g_pv[k].env / 240.0f + 1e-6f; }
+    int cnt = 0, oldest = -1; unsigned oa = 0xffffffffu;
+    for (int k = 0; k < PAD_VOICES; k++) {
+        PVoice *o = &g_pv[k];
+        if (o->pad != i || o->stage == 0 || o->stage == 4) continue;
+        if (p->mode != 0) { pv_fade(o); continue; }        /* GATE / LOOP: повторный удар заменяет прежний */
+        cnt++;
+        if ((int)(o->age - oa) < 0 || oldest < 0) { oa = o->age; oldest = k; }
+    }
+    if (p->mode == 0 && cnt >= PAD_LAYERS && oldest >= 0) pv_fade(&g_pv[oldest]);   /* ONE-SHOT: слои, лишний старый плавно уходит */
     int fv = -1;
     for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].stage == 0) { fv = k; break; }
-    if (fv < 0) { float me = 1e9f; for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].env < me) { me = g_pv[k].env; fv = k; } }
+    if (fv < 0) {                                          /* свободных нет: берём самый тихий (уходящие в приоритете) */
+        float me = 1e9f;
+        for (int k = 0; k < PAD_VOICES; k++) { float e = g_pv[k].env + (g_pv[k].stage == 4 ? 0.0f : 1.0f); if (e < me) { me = e; fv = k; } }
+    }
     PVoice *v = &g_pv[fv];
-    v->pad = i; v->stage = 1; v->gate = 1; v->env = 0.0f; v->rel = 0.0f; v->cenv = 0.0f; v->cg = 1.0f;
+    v->pad = i; v->stage = 1; v->gate = 1; v->env = 0.0f; v->rel = 0.0f; v->cenv = 0.0f; v->cg = 1.0f; v->age = ++g_pv_age;
     v->pos = (double)p->n * (double)p->start / 100.0;
 }
 static void pad_voice_release(int i) {
@@ -886,6 +911,12 @@ static void pad_voice_release(int i) {
             v->stage = 4; v->rel = (v->env > 1e-4f ? v->env : 1e-4f) / rs;
         }
     }
+}
+/* перед заменой сэмпла: голоса пада плавно гаснут (5 мс), ждём два блока - щелчка при смене нет */
+static void pad_quiet(int i) {
+    int any = 0;
+    for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].pad == i && g_pv[k].stage != 0) { pv_fade(&g_pv[k]); any = 1; }
+    if (any) sceKernelDelayThread(50000);
 }
 static int pad_busy(void) {
     for (int i = 0; i < PAD_N; i++) if (g_pad_trig[i] != g_pad_seen_t[i] || g_pad_rel[i] != g_pad_seen_r[i]) return 1;
@@ -914,6 +945,7 @@ static void pad_mix_add(int16_t *mono, int *peak) {
         if (ds < 48.0f) ds = 48.0f;
         if (rs < 96.0f) rs = 96.0f;
         const float sus = (float)p->s / 100.0f;
+        const float ia = 1.0f / as, id = (1.0f - sus) / ds;
         float gain = (float)p->vol / 100.0f; gain = gain * sqrtf(gain) * 0.9f;
         const int comp_on = (p->cth < 100 && p->crat > 0) || p->cmk > 0;
         const float cthr = powf(10.0f, -48.0f * (1.0f - (float)p->cth / 100.0f) / 20.0f);
@@ -932,8 +964,8 @@ static void pad_mix_add(int16_t *mono, int *peak) {
             float fr = (float)(v->pos - (double)ix);
             float smp = (float)p->d[ix] + ((float)p->d[ix + 1] - (float)p->d[ix]) * fr;
             switch (v->stage) {
-            case 1: v->env += 1.0f / as; if (v->env >= 1.0f) { v->env = 1.0f; v->stage = 2; } break;
-            case 2: v->env -= (1.0f - sus) / ds; if (v->env <= sus) { v->env = sus; v->stage = 3; } break;
+            case 1: v->env += ia; if (v->env >= 1.0f) { v->env = 1.0f; v->stage = 2; } break;
+            case 2: v->env -= id; if (v->env <= sus) { v->env = sus; v->stage = 3; } break;
             case 3: break;
             default: v->env -= v->rel; if (v->env <= 0.0f) { v->env = 0.0f; v->stage = 0; } break;
             }
@@ -961,8 +993,12 @@ static void pad_mix_add(int16_t *mono, int *peak) {
     if (!any) return;
     int pk = 0;
     for (int i = 0; i < OUT_GRAIN; i++) {
-        int s = (int)mono[i] + (int)acc[i];
-        s = clamp16(s);
+        float f = (float)mono[i] + acc[i];
+        if (f > 24000.0f || f < -24000.0f) {                 /* мягкий лимитер вместо среза: колено с 24000 */
+            float a = fabsf(f) - 24000.0f, sg = f < 0 ? -1.0f : 1.0f;
+            f = sg * (24000.0f + 8767.0f * (a / (a + 8767.0f)));
+        }
+        int s = clamp16((int)f);
         mono[i] = (int16_t)s;
         int a = s < 0 ? -s : s;
         if (a > pk) pk = a;
@@ -1039,6 +1075,7 @@ static int pad_load_wav(int pi, const char *path, char *err, size_t ecap) {
         pk[c] = (uint8_t)(mx >> 7 > 255 ? 255 : mx >> 7);
     }
     if (p->d) {
+        pad_quiet(pi);
         p->loading = 1;                                /* аудиопоток снимает голоса этого пэда, потом можно менять буфер */
         sceKernelDelayThread(60000);
     }
@@ -1360,6 +1397,7 @@ static int out_thread(SceSize args, void *argp) {
         prm.scrub = scrub_now;
         prm.rev = rev;
         int peak = 0;
+        uint64_t t_calc0 = sceKernelGetProcessTimeWide();
         int ended = engine_render(&eng, g_audio, len, &prm, mono, &peak);
         prm_prev = prm;
         have_prm = 1;
@@ -1371,6 +1409,12 @@ static int out_thread(SceSize args, void *argp) {
             if (pk2 > peak) peak = pk2;
         }
         pad_mix_add(mono, &peak);
+        {
+            int ld = (int)((sceKernelGetProcessTimeWide() - t_calc0) * 1000 / 21333);
+            static int ld_pk = 0, ld_n = 0;
+            if (ld > ld_pk) ld_pk = ld;
+            if (++ld_n >= 70) { g_out_load = ld_pk; ld_pk = 0; ld_n = 0; }
+        }
 
         int16_t *ob = out_bufs[bi];
         if (out_ch == 1) {
@@ -2883,7 +2927,38 @@ static int btn_geom(int id, int *x, int *y, int *w, int *h) {
 }
 
 /* что под пальцем: кнопка, пад, ручка (B_KNOB0 + номер) */
+/* ---- клавиатура GRAIN: 2 октавы C..C (25 клавиш), клавиша = сдвиг тона дорожки и зёрен, скорость не меняется ---- */
+#define KB_X 24
+#define KB_Y 486
+#define KB_WW 52              /* ширина белой клавиши */
+#define KB_H 46
+#define KB_BH 28
+#define KB_BW 30
+static const int kb_wn[7] = { 0, 2, 4, 5, 7, 9, 11 };
+static int kb_has_black(int w) { int m = w % 7; return w < 14 && (m == 0 || m == 1 || m == 3 || m == 4 || m == 5); }
+static int kb_hit(double fx, double fy) {                   /* номер 0..24 или -1; чёрные клавиши в приоритете */
+    if (fy < KB_Y - 6 || fy > KB_Y + KB_H + 6 || fx < KB_X || fx >= KB_X + 15 * KB_WW) return -1;
+    if (fy < KB_Y + KB_BH)
+        for (int w = 0; w < 14; w++) {
+            if (!kb_has_black(w)) continue;
+            double cx = KB_X + (w + 1) * KB_WW;
+            if (fabs(fx - cx) < KB_BW * 0.5) return 12 * (w / 7) + kb_wn[w % 7] + 1;
+        }
+    int w = (int)((fx - KB_X) / KB_WW);
+    if (w < 0) w = 0;
+    if (w > 14) w = 14;
+    return 12 * (w / 7) + kb_wn[w % 7];
+}
+/* на странице GRAIN ручки поднимаются, освобождая место клавиатуре; на остальных страницах - на своих местах */
+static void knobs_relayout(int page) {
+    static const int base[12] = { 438, 438, 438, 436, 436, 436, 436, 440, 440, 448, 448, 436 };
+    for (int k = 0; k < 12; k++) {
+        if (!(g_kd[k].pages & (1 << 2))) continue;
+        g_kd[k].cy = base[k] - (page == 2 ? 26 : 0);
+    }
+}
 static int hit_test(int tx, int ty, int page, int sec, int sl_n) {
+    knobs_relayout(page);
     int ids[26], n = 0;
     ids[n++] = B_TAB0; ids[n++] = B_TAB1; ids[n++] = B_TAB2; ids[n++] = B_TAB3; ids[n++] = B_TAB4; ids[n++] = B_TAB5;
     if (page == 5) { ids[n++] = B_PLOAD; ids[n++] = B_PMODE; ids[n++] = B_PENV; ids[n++] = B_PCMP; ids[n++] = B_PCLR; }
@@ -2935,7 +3010,7 @@ typedef struct {
     int sl_n, sl_sel, sl_flash, sl_playing;
     int btn_down, can_undo, knob_down;
     int crop_armed, legend, rev, bpm, bpm_t, bpm_b;
-    int gr_on, flt_type, peak_pct;
+    int gr_on, flt_type, peak_pct, kb_note;
     double scrub_pos, scrub_speed;
     unsigned frame;
     Layout lay;
@@ -3180,7 +3255,8 @@ static void top_render(Canvas *c, const UiState *u) {
 #define W_GRON    62
 #define W_FT0     63           /* 63..66 типы фильтра */
 #define W_CURVE   67
-#define W_COUNT   68      /* W_SIDE0 + 4 (пятая кнопка PAD) = 60, на странице PAD W_SEG0 не используется */
+#define W_KB      68
+#define W_COUNT   69      /* W_SIDE0 + 4 (пятая кнопка PAD) = 60, на странице PAD W_SEG0 не используется */
 static int g_wcode[W_COUNT];
 static int g_page_key = -1;
 
@@ -3320,6 +3396,7 @@ static void pad_sync(void) {
 static void pad_clear(int i) {
     Pad *p = &g_pad[i];
     if (!p->d) return;
+    pad_quiet(i);
     p->loading = 1;
     sceKernelDelayThread(60000);
     int16_t *old = p->d;
@@ -3439,6 +3516,7 @@ static int edit_style(const UiState *u, int id) {
 static int ctl_update(Canvas *c, const UiState *u) {
     const int page = u->page;
     const int oy = (page == 5) ? PAD_CY : CTL_TY;
+    knobs_relayout(page);
     int key = page * 1000 + (page == 1 ? u->sl_n : 0) + (page == 3 ? u->fx_sec * 100 : 0) + (page == 5 ? g_pad_env_sub * 100 : 0);
     int changed = 0;
     if (key != g_page_key) {
@@ -3514,6 +3592,26 @@ static int ctl_update(Canvas *c, const UiState *u) {
             }
         }
     } else if (page == 2) {
+        if (u->kb_note + 2 != g_wcode[W_KB]) {                  /* клавиатура: перерисовываем только при смене нажатой клавиши */
+            cv_clear_rect(c, KB_X - 8, KB_Y - CTL_TY - 6, 15 * KB_WW + 16, KB_H + 16);
+            for (int w = 0; w < 15; w++) {
+                int note = 12 * (w / 7) + kb_wn[w % 7], on = (u->kb_note == note);
+                float x = (float)(KB_X + w * KB_WW);
+                cv_shadow(c, x + 1, (float)(KB_Y - CTL_TY), (float)KB_WW - 2, (float)KB_H, 4.0f, 2.0f);
+                cv_rrect_grad(c, x + 1, (float)(KB_Y - CTL_TY + (on ? 2 : 0)), (float)KB_WW - 2, (float)KB_H - (on ? 2 : 0), 4.0f,
+                              on ? RGBA8(255, 190, 110, 255) : RGBA8(252, 249, 240, 255), on ? RGBA8(240, 150, 70, 255) : RGBA8(222, 214, 196, 255));
+                if (note == 12) cv_circle(c, x + KB_WW * 0.5f, (float)(KB_Y - CTL_TY + KB_H - 9), 3.0f, K_ORANGE_LO);   /* ноль: тон не меняется */
+            }
+            for (int w = 0; w < 14; w++) {
+                if (!kb_has_black(w)) continue;
+                int note = 12 * (w / 7) + kb_wn[w % 7] + 1, on = (u->kb_note == note);
+                float x = (float)(KB_X + (w + 1) * KB_WW) - KB_BW * 0.5f;
+                cv_rrect_grad(c, x, (float)(KB_Y - CTL_TY), (float)KB_BW, (float)KB_BH, 3.0f,
+                              on ? RGBA8(250, 140, 60, 255) : RGBA8(92, 82, 74, 255), on ? RGBA8(200, 96, 36, 255) : RGBA8(40, 34, 30, 255));
+            }
+            g_wcode[W_KB] = u->kb_note + 2;
+            changed = 1;
+        }
         int code = 1 + (u->gr_on ? 1 : 0) + 4 * (u->btn_down == B_GR_ON);
         if (code != g_wcode[W_GRON]) {
             int x, y, w, h;
@@ -3957,6 +4055,7 @@ static void draw_pad_list(void) {
 }
 
 static void ui_draw(const UiState *u) {
+    knobs_relayout(u->page);
     char buf[200], t1[32];
     static const char *page_name[6] = { "EDIT", "SLICE", "GRAIN", "ADV", "FX", "PAD" };
 
@@ -3965,7 +4064,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя планка */
     text(50, 22, K_BROWN, 1.1f, "VITA SAMPLER");
-    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.5");
+    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.6");
     text(560, 26, K_BROWN, 0.62f, "REC");
     text(648, 26, K_BROWN, 0.62f, "PLAY");
     text(736, 26, K_BROWN, 0.62f, "LOOP");
@@ -4015,6 +4114,7 @@ static void ui_draw(const UiState *u) {
             char a1[24], a2[24], a3[24], a4[24], a5[24];
             knob_text(4, a1, sizeof(a1)); knob_text(5, a2, sizeof(a2)); knob_text(6, a3, sizeof(a3)); knob_text(3, a4, sizeof(a4)); knob_text(11, a5, sizeof(a5));
             snprintf(buf, sizeof(buf), "GRAINS %s   SIZE %s   SPREAD %s   DETUNE %s   MIX %s   %s", a1, a2, a3, a5, a4, u->gr_on ? "ON" : "OFF");
+            if (u->kb_note >= 0) { char kb[24]; snprintf(kb, sizeof(kb), "   KEY %+d st", u->kb_note - 12); strncat(buf, kb, sizeof(buf) - strlen(buf) - 1); }
         } else if (u->page == 3) {
             static const char *ft[4] = { "OFF", "LOWPASS", "HIGHPASS", "BANDPASS" };
             char a1[24], a2[24];
@@ -4056,7 +4156,7 @@ static void ui_draw(const UiState *u) {
             "       touch the top of the wave next to A or B and drag = move it; inside A-B = move both",
             "       CROP (tap twice)  UNDO  REVERSE (hold = bake)  NORMALIZE      touch lower part of the wave = scrub",
             "SLICE  regions are built inside A-B chosen in EDIT     X  play slice     BPM +/- = tempo (speed follows)",
-            "GRAIN  cloud of grains around the play line: MIX, GRAINS, SIZE, SPREAD, DETUNE     GRAIN ON  switch",
+            "GRAIN  cloud of grains around the play line: MIX, GRAINS, SIZE, SPREAD, DETUNE     GRAIN ON  switch     KEYS  pitch",
             "ADV    DELETE region   SILENCE region   DUPLICATE region   + SILENCE (same width, right of the region)",
             "FX     FILTER: LPF / HPF / BPF (BPF = center + width), drag in the curve window     CRUSH: bits, rate",
             "KNOBS  touch a knob and drag up / down (or left / right); double tap = default",
@@ -4281,6 +4381,7 @@ static void enforce_cursors(int length) {
 typedef struct {
     int page, fx_sec, x_hold;
     int knob_on, knob_k, knob_id, knob_last_k; unsigned knob_last_frame;
+    int kb_on, kb_id, kb_started, kb_loop0;      /* клавиатура GRAIN: касание, запустила ли она воспроизведение, прежний LOOP */
     double knob_x0, knob_y0, knob_v0;
     int curve_on, curve_id;
     int confirm; unsigned confirm_frame;
@@ -4427,6 +4528,24 @@ static void act_play_toggle(void) {
     g_state = ST_PLAYING;
     snprintf(msg, sizeof(msg), g_loop ? "Playing (loop)" : "Playing");
     dbg_log("play");
+}
+
+/* клавиатура GRAIN: нажатие запускает воспроизведение (если стоит) в петле, отпускание - плавно останавливает */
+static void kb_press(int note) {
+    g_kb_semi = note - 12;
+    if (!g_kb_on && !A.kb_started && g_state == ST_IDLE && g_length > 1) {
+        A.kb_loop0 = g_loop; g_loop = 1; A.kb_started = 1;
+        act_play_toggle();
+    }
+    g_kb_on = 1;
+}
+static void kb_release(void) {
+    g_kb_on = 0;
+    if (A.kb_started) {
+        A.kb_started = 0;
+        if (g_state == ST_PLAYING) g_state = ST_IDLE;
+        g_loop = A.kb_loop0;
+    }
 }
 
 /* стоп: следующее воспроизведение начнётся с начала области (A или начало региона) */
@@ -4906,7 +5025,15 @@ static void slice_nudge(int idx, int delta) {
 }
 
 /* ---- PAD: действия ---- */
+static uint64_t g_pad_last_us[PAD_N];                /* защита от дребезга: один пад не чаще раза в 30 мс */
+static int pad_lockout(int i) {
+    uint64_t t = sceKernelGetProcessTimeWide();
+    if (g_pad_last_us[i] && t - g_pad_last_us[i] < 30000) return 1;
+    g_pad_last_us[i] = t;
+    return 0;
+}
 static void pad_press(int id, int i) {
+    if (pad_lockout(i)) { g_pu.sel = i; return; }
     int slot = -1;
     for (int k = 0; k < 4; k++) if (A.pt_id[k] == -1) { slot = k; break; }
     g_pu.sel = i;
@@ -4922,7 +5049,7 @@ static void pad_release_slot(int slot) {
     for (int k = 0; k < 4; k++) if (A.pt_id[k] != -1 && A.pt_pad[k] == i) still = 1;
     if (!still) g_pu.down_mask &= ~(1 << i);
 }
-static void pad_tap(int i) { g_pu.sel = i; g_pad_trig[i]++; g_pad_rel[i]++; }
+static void pad_tap(int i) { g_pu.sel = i; if (pad_lockout(i)) return; g_pad_trig[i]++; g_pad_rel[i]++; }
 
 static void pad_list_open(void) {
     pad_list_scan();
@@ -5020,7 +5147,11 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v1.5");
+    dbg_log("start v1.6");
+    scePowerSetArmClockFrequency(444);              /* максимум: больше запаса для звука и отрисовки */
+    scePowerSetBusClockFrequency(222);
+    scePowerSetGpuClockFrequency(222);
+    scePowerSetGpuXbarClockFrequency(166);
 
     g_audio = (int16_t *)malloc(MAX_SAMPLES * sizeof(int16_t));
     if (!g_audio) { dbg_log("malloc failed"); sceKernelExitProcess(0); }
@@ -5042,6 +5173,7 @@ int main(void) {
     A.scrub_id = -1; A.btn_down = -1; A.btn_id = -1; A.knob_last_k = -1; A.knob_id = -1; A.curve_id = -1;
     for (int i = 0; i < 6; i++) A.prev_ids[i] = -1;
     for (int i = 0; i < 4; i++) A.pt_id[i] = -1;
+    A.kb_on = 0; A.kb_id = -1;
     kit_install();                              /* заводские звуки (если ещё не записаны) */
     pad_cfg_load();
 
@@ -5433,6 +5565,7 @@ int main(void) {
                 for (int e2 = 0; e2 < si && !skip; e2++)
                     for (unsigned q2 = 0; q2 < tbuf[e2].reportNum && q2 < 6; q2++) if (tbuf[e2].report[q2].id == id) skip = 1;
                 if (skip) continue;
+                if (tbuf[si].report[q].x < 8 || tbuf[si].report[q].x > 1911 || tbuf[si].report[q].y < 8 || tbuf[si].report[q].y > 1079) continue;
                 int hit = hit_test((int)(tbuf[si].report[q].x / 2), (int)(tbuf[si].report[q].y / 2), A.page, A.fx_sec, g_sl_n);
                 if (hit != B_NONE && hit < B_KNOB0) perform_hit(hit);
                 else if (hit >= B_PAD0) perform_hit(hit);
@@ -5446,6 +5579,7 @@ int main(void) {
             for (int j = 0; j < A.prev_n; j++) if (A.prev_ids[j] == id) is_new = 0;
             if (!is_new) continue;
             double fx = touch.report[k].x / 2.0, fy = touch.report[k].y / 2.0;
+            if (fx < 4.0 || fx > 956.0 || fy < 4.0 || fy > 540.0) continue;      /* самый край экрана - там держат консоль, ложные касания */
             int in_wave = (A.page != 5 && fx >= WAVE_X - 4 && fx <= WAVE_X + WAVE_W + 4 && fy >= WAVE_Y - 18 && fy <= WAVE_Y + WAVE_H + 18);
 
             if (A.page == 5) {                                    /* PAD: список WAV и пады */
@@ -5455,6 +5589,10 @@ int main(void) {
                 }
                 int ph = hit_test((int)fx, (int)fy, A.page, A.fx_sec, g_sl_n);
                 if (ph >= B_PAD0) { pad_press(id, ph - B_PAD0); continue; }
+            }
+            if (A.page == 2 && !A.kb_on) {                        /* клавиатура GRAIN */
+                int kn = kb_hit(fx, fy);
+                if (kn >= 0) { A.kb_on = 1; A.kb_id = id; kb_press(kn); continue; }
             }
             if (in_wave && g_mode == 1 && A.page != 2 && !A.sdrag_on && !A.scrubbing && g_state != ST_RECORDING
                 && length > 1 && fy < WAVE_Y + 46) {
@@ -5606,10 +5744,16 @@ int main(void) {
         }
 
         /* уже идущие касания */
-        int ls_alive = 0, scrub_alive = 0, knob_alive = 0, curve_alive = 0, btn_alive = 0, sdrag_alive = 0, drag_alive[3] = { 0, 0, 0 };
+        int kb_alive = 0, ls_alive = 0, scrub_alive = 0, knob_alive = 0, curve_alive = 0, btn_alive = 0, sdrag_alive = 0, drag_alive[3] = { 0, 0, 0 };
         for (int k = 0; k < nrep; k++) {
             int id = touch.report[k].id;
             double fx = touch.report[k].x / 2.0;
+            if (A.kb_on && id == A.kb_id) {                       /* палец ведёт по клавишам - глиссандо */
+                kb_alive = 1;
+                int kn = kb_hit(fx, touch.report[k].y / 2.0);
+                if (kn >= 0 && kn != g_kb_semi + 12) g_kb_semi = kn - 12;
+                continue;
+            }
             if (A.scrubbing && id == A.scrub_id) {
                 scrub_alive = 1;
                 int seg = 0;
@@ -5753,6 +5897,7 @@ int main(void) {
         for (int w = 0; w < 3; w++)
             if (A.drag_on[w] && !drag_alive[w]) { A.drag_on[w] = 0; request_autosave(length, 0); }
         if (A.knob_on && !knob_alive) A.knob_on = 0;
+        if (A.kb_on && (!kb_alive || A.page != 2)) { A.kb_on = 0; kb_release(); }
         if (A.curve_on && !curve_alive) A.curve_on = 0;
         if (A.btn_down != B_NONE && !btn_alive) { A.btn_down = B_NONE; A.btn_id = -1; A.btn_hold = 0; }
         A.prev_n = nrep;
@@ -5800,9 +5945,9 @@ int main(void) {
 
         /* ---- лог: пульс раз в ~1.5 с и ошибки ---- */
         if (frame % 90 == 0)
-            dbg_log("hb f=%u st=%d mode=%d len=%d pos=%d lvl=%d split=%d fx=%d scrub=%d mic_late=%d mic_odd=%d r0=%d out_late=%d",
+            dbg_log("hb f=%u st=%d mode=%d len=%d pos=%d lvl=%d split=%d fx=%d scrub=%d mic_late=%d mic_odd=%d r0=%d out_late=%d load=%d",
                     frame, state, g_mode, length, playhead, g_level, split, A.page, A.scrubbing,
-                    g_in_late, g_in_odd, g_in_r0, g_out_late);
+                    g_in_late, g_in_odd, g_in_r0, g_out_late, g_out_load);
         if (g_error != last_err) { last_err = g_error; dbg_log("audio error 0x%08X", (unsigned)g_error); }
         prev_state = state;
 
@@ -5823,7 +5968,7 @@ int main(void) {
         if (g_pu.cfg_dirty && ++g_pu.cfg_cnt > 90) { g_pu.cfg_dirty = 0; pad_cfg_save(); }   /* настройки пэдов пишем с задержкой после последней правки */
         UiState u;
         memset(&u, 0, sizeof(u));
-        u.legend = g_legend; u.rev = g_rev_req; u.bpm = g_sl_bpm; u.bpm_t = g_bpm_target; u.bpm_b = g_bpm_base; u.mode = g_mode; u.page = A.page; u.fx_sec = A.fx_sec; u.gr_on = g_gr_on; u.flt_type = g_flt_type; u.knob_down = A.knob_on ? A.knob_k : -1; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
+        u.legend = g_legend; u.rev = g_rev_req; u.bpm = g_sl_bpm; u.bpm_t = g_bpm_target; u.bpm_b = g_bpm_base; u.mode = g_mode; u.page = A.page; u.fx_sec = A.fx_sec; u.gr_on = g_gr_on; u.kb_note = g_kb_on ? g_kb_semi + 12 : -1; u.flt_type = g_flt_type; u.knob_down = A.knob_on ? A.knob_k : -1; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;
         u.length = length; u.playhead = playhead; u.live = live;
         u.split = split; u.active = active; u.c1 = c1; u.c2 = c2;
         u.level_pct = shown_level; u.peak_pct = peak_hold; u.clip = clip_hold;
