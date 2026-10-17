@@ -1,5 +1,5 @@
 /*
- * Vita Sampler v1.4
+ * Vita Sampler v1.5
  *
  * Кнопки: R запись/стоп, L пауза/play (удержание L = глитч, задняя панель: палец вверх/вниз = 1-30 Гц),
  *   Треугольник стоп, Квадрат петля, Круг страница FX, START сохранить WAV, SELECT справка,
@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <math.h>
@@ -25,6 +26,7 @@
 #include <psp2/ime_dialog.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/dirent.h>
 #include <vita2d.h>
 #include <png.h>
 
@@ -812,6 +814,245 @@ static int in_thread(SceSize args, void *argp) {
 }
 
 /* ---------- Открытие аудио-выхода ---------- */
+/* ====================================================================
+ *  PAD (MPC): до 16 сэмплов из WAV на пэдах, ADSR, режимы ONE-SHOT / GATE / LOOP
+ *  Голоса смешиваются в потоке вывода поверх основного звука (работают и без воспроизведения дорожки).
+ * ==================================================================== */
+#define PAD_N 16
+#define PAD_VOICES 24
+#define PAD_CFG "ux0:data/Sampler/pads.cfg"
+typedef struct {
+    int16_t *d; int n, rate;
+    char path[160], name[32];
+    volatile int loading;
+    uint8_t pk[208];                               /* обзор волны для экрана */
+    int vol, pitch, start, mode, a, dc, s, r;      /* vol 0..100, pitch 0..48 (=-24..+24 пт), start 0..99 %, mode 0/1/2, a/dc/r 0..100 (время), s 0..100 % */
+} Pad;
+#define PAD_PK 208
+static Pad g_pad[PAD_N];
+static volatile int g_pe_vol = 80, g_pe_pitch = 24, g_pe_start = 0;   /* значения ручек выбранного пада */
+typedef struct { int pad, stage, gate; double pos; float env, rel; } PVoice;   /* stage: 0 пусто, 1 A, 2 D, 3 S, 4 R */
+static PVoice g_pv[PAD_VOICES];
+static volatile unsigned g_pad_trig[PAD_N], g_pad_rel[PAD_N];
+static volatile int g_pad_mask;                    /* биты пэдов, у которых сейчас звучит голос (для индикации) */
+static unsigned g_pad_seen_t[PAD_N], g_pad_seen_r[PAD_N];
+
+static float pad_ms(int v) { float t = (float)v / 100.0f; return 3000.0f * t * t; }
+static void pad_defaults(Pad *p) { p->vol = 80; p->pitch = 24; p->start = 0; p->mode = 0; p->a = 0; p->dc = 30; p->s = 100; p->r = 10; }
+
+static void pad_voice_trigger(int i) {
+    Pad *p = &g_pad[i];
+    if (!p->d || p->loading || p->n < 2) return;
+    for (int k = 0; k < PAD_VOICES; k++)                                   /* повторный удар: старый голос быстро (5 мс) гаснет */
+        if (g_pv[k].pad == i && g_pv[k].stage != 0 && g_pv[k].stage != 4) { g_pv[k].stage = 4; g_pv[k].rel = g_pv[k].env / 240.0f + 1e-6f; }
+    int fv = -1;
+    for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].stage == 0) { fv = k; break; }
+    if (fv < 0) { float me = 1e9f; for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].env < me) { me = g_pv[k].env; fv = k; } }
+    PVoice *v = &g_pv[fv];
+    v->pad = i; v->stage = 1; v->gate = 1; v->env = 0.0f; v->rel = 0.0f;
+    v->pos = (double)p->n * (double)p->start / 100.0;
+}
+static void pad_voice_release(int i) {
+    Pad *p = &g_pad[i];
+    for (int k = 0; k < PAD_VOICES; k++) {
+        PVoice *v = &g_pv[k];
+        if (v->pad != i || v->stage == 0 || !v->gate) continue;
+        v->gate = 0;
+        if (p->mode != 0 && v->stage < 4) {
+            float rs = pad_ms(p->r) * 48.0f;
+            if (rs < 96.0f) rs = 96.0f;
+            v->stage = 4; v->rel = (v->env > 1e-4f ? v->env : 1e-4f) / rs;
+        }
+    }
+}
+static int pad_busy(void) {
+    for (int i = 0; i < PAD_N; i++) if (g_pad_trig[i] != g_pad_seen_t[i] || g_pad_rel[i] != g_pad_seen_r[i]) return 1;
+    for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].stage != 0) return 1;
+    return 0;
+}
+/* добавляет голоса пэдов в mono[OUT_GRAIN]; peak - пик результата */
+static void pad_mix_add(int16_t *mono, int *peak) {
+    for (int i = 0; i < PAD_N; i++) {
+        unsigned t = g_pad_trig[i], r = g_pad_rel[i];
+        if (t != g_pad_seen_t[i]) { g_pad_seen_t[i] = t; pad_voice_trigger(i); }
+        if (r != g_pad_seen_r[i]) { g_pad_seen_r[i] = r; pad_voice_release(i); }
+    }
+    static float acc[OUT_GRAIN];
+    int any = 0, mask = 0;
+    memset(acc, 0, sizeof(acc));
+    for (int k = 0; k < PAD_VOICES; k++) {
+        PVoice *v = &g_pv[k];
+        if (v->stage == 0) continue;
+        Pad *p = &g_pad[v->pad];
+        if (!p->d || p->loading || p->n < 2) { v->stage = 0; continue; }
+        any = 1; mask |= 1 << v->pad;
+        const float step = (float)p->rate / 48000.0f * powf(2.0f, (float)(p->pitch - 24) / 12.0f);
+        float as = pad_ms(p->a) * 48.0f, ds = pad_ms(p->dc) * 48.0f, rs = pad_ms(p->r) * 48.0f;
+        if (as < 96.0f) as = 96.0f;
+        if (ds < 48.0f) ds = 48.0f;
+        if (rs < 96.0f) rs = 96.0f;
+        const float sus = (float)p->s / 100.0f;
+        float gain = (float)p->vol / 100.0f; gain = gain * sqrtf(gain) * 0.9f;
+        const double endp = (double)(p->n - 1);
+        const double lstart = (double)p->n * (double)p->start / 100.0;
+        const double rthr = endp - (double)step * (double)rs;
+        for (int i = 0; i < OUT_GRAIN; i++) {
+            if (v->pos >= endp) {
+                if (p->mode == 2 && v->stage != 4 && endp - lstart > 16.0) v->pos -= (endp - lstart);
+                else { v->stage = 0; break; }
+            }
+            int ix = (int)v->pos;
+            float fr = (float)(v->pos - (double)ix);
+            float smp = (float)p->d[ix] + ((float)p->d[ix + 1] - (float)p->d[ix]) * fr;
+            switch (v->stage) {
+            case 1: v->env += 1.0f / as; if (v->env >= 1.0f) { v->env = 1.0f; v->stage = 2; } break;
+            case 2: v->env -= (1.0f - sus) / ds; if (v->env <= sus) { v->env = sus; v->stage = 3; } break;
+            case 3: break;
+            default: v->env -= v->rel; if (v->env <= 0.0f) { v->env = 0.0f; v->stage = 0; } break;
+            }
+            if (v->stage == 0) break;
+            if (p->mode == 0 && v->stage != 4 && v->pos >= rthr) {          /* ONE-SHOT: хвост затухает как раз до конца сэмпла */
+                float rem = (float)((endp - v->pos) / (double)step);
+                v->stage = 4; v->rel = v->env / (rem > 1.0f ? rem : 1.0f);
+            }
+            acc[i] += smp * v->env * gain;
+            v->pos += (double)step;
+        }
+    }
+    g_pad_mask = mask;
+    if (!any) return;
+    int pk = 0;
+    for (int i = 0; i < OUT_GRAIN; i++) {
+        int s = (int)mono[i] + (int)acc[i];
+        s = clamp16(s);
+        mono[i] = (int16_t)s;
+        int a = s < 0 ? -s : s;
+        if (a > pk) pk = a;
+    }
+    if (pk > *peak) *peak = pk;
+}
+
+/* ---- загрузка WAV: PCM 8/16/24/32, float32, моно/стерео (стерео усредняется), любая частота до 96 кГц, не длиннее 60 с ---- */
+static uint32_t rd32(const unsigned char *b) { return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24); }
+static int pad_load_wav(int pi, const char *path, char *err, size_t ecap) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { snprintf(err, ecap, "Cannot open the file"); return 0; }
+    unsigned char hd[12];
+    if (fread(hd, 1, 12, f) != 12 || memcmp(hd, "RIFF", 4) || memcmp(hd + 8, "WAVE", 4)) { fclose(f); snprintf(err, ecap, "Not a WAV file"); return 0; }
+    int fmt = 0, ch = 0, bits = 0; unsigned rate = 0;
+    long data_off = -1; uint32_t data_sz = 0;
+    for (;;) {
+        unsigned char ck[8];
+        if (fread(ck, 1, 8, f) != 8) break;
+        uint32_t sz = rd32(ck + 4);
+        long here = ftell(f);
+        if (!memcmp(ck, "fmt ", 4) && sz >= 16) {
+            unsigned char fb[40]; memset(fb, 0, sizeof fb);
+            size_t rn = sz < 40 ? sz : 40;
+            if (fread(fb, 1, rn, f) != rn) break;
+            fmt = fb[0] | (fb[1] << 8); ch = fb[2] | (fb[3] << 8); rate = rd32(fb + 4); bits = fb[14] | (fb[15] << 8);
+            if (fmt == 0xFFFE && sz >= 26) fmt = fb[24] | (fb[25] << 8);
+        } else if (!memcmp(ck, "data", 4)) { data_off = here; data_sz = sz; break; }
+        fseek(f, here + (long)sz + (long)(sz & 1u), SEEK_SET);
+    }
+    if (data_off < 0 || ch < 1 || ch > 8 || rate < 4000 || rate > 96000 || !((fmt == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) || (fmt == 3 && bits == 32))) {
+        fclose(f); snprintf(err, ecap, "Unsupported WAV format"); return 0;
+    }
+    int bps = bits / 8;
+    long frames = (long)(data_sz / (uint32_t)(bps * ch));
+    long maxf = (long)rate * 60;
+    if (frames > maxf) frames = maxf;
+    if (frames < 16) { fclose(f); snprintf(err, ecap, "The file is too short"); return 0; }
+    int16_t *out = (int16_t *)malloc((size_t)frames * 2);
+    unsigned char *blk = (unsigned char *)malloc((size_t)bps * ch * 4096);
+    if (!out || !blk) { free(out); free(blk); fclose(f); snprintf(err, ecap, "Out of memory"); return 0; }
+    fseek(f, data_off, SEEK_SET);
+    long done = 0;
+    while (done < frames) {
+        long nf = frames - done; if (nf > 4096) nf = 4096;
+        if (fread(blk, (size_t)bps * ch, (size_t)nf, f) != (size_t)nf) { frames = done; break; }
+        for (long i = 0; i < nf; i++) {
+            float acc = 0.0f; int cc = ch < 2 ? ch : 2;
+            for (int c = 0; c < cc; c++) {
+                const unsigned char *q = blk + (size_t)(i * ch + c) * (size_t)bps;
+                float v;
+                if (fmt == 3) { float fl; memcpy(&fl, q, 4); v = fl * 32767.0f; }
+                else if (bits == 8) v = ((float)q[0] - 128.0f) * 256.0f;
+                else if (bits == 16) v = (float)(int16_t)(q[0] | (q[1] << 8));
+                else if (bits == 24) v = (float)((int32_t)((uint32_t)q[0] << 8 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 24) >> 16);
+                else v = (float)((int32_t)rd32(q) >> 16);
+                acc += v;
+            }
+            acc /= (float)cc;
+            int iv = (int)(acc + (acc < 0 ? -0.5f : 0.5f));
+            out[done + i] = (int16_t)clamp16(iv);
+        }
+        done += nf;
+    }
+    free(blk); fclose(f);
+    if (frames < 16) { free(out); snprintf(err, ecap, "The file is too short"); return 0; }
+    Pad *p = &g_pad[pi];
+    uint8_t pk[PAD_PK];
+    for (int c = 0; c < PAD_PK; c++) {
+        long a = frames * c / PAD_PK, b = frames * (c + 1) / PAD_PK;
+        if (b <= a) b = a + 1;
+        int mx = 0;
+        for (long i = a; i < b && i < frames; i++) { int v = out[i] < 0 ? -out[i] : out[i]; if (v > mx) mx = v; }
+        pk[c] = (uint8_t)(mx >> 7 > 255 ? 255 : mx >> 7);
+    }
+    if (p->d) {
+        p->loading = 1;                                /* аудиопоток снимает голоса этого пэда, потом можно менять буфер */
+        sceKernelDelayThread(60000);
+    }
+    memcpy(p->pk, pk, sizeof(pk));
+    int16_t *old = p->d;
+    p->d = out; p->n = (int)frames; p->rate = (int)rate;
+    snprintf(p->path, sizeof(p->path), "%s", path);
+    const char *b = strrchr(path, '/');
+    snprintf(p->name, sizeof(p->name), "%s", b ? b + 1 : path);
+    size_t nl = strlen(p->name);
+    if (nl > 4 && strcasecmp(p->name + nl - 4, ".wav") == 0) p->name[nl - 4] = 0;
+    p->loading = 0;
+    free(old);
+    return 1;
+}
+
+/* ---- настройки пэдов: файл pads.cfg ---- */
+typedef struct { char path[160]; int32_t v[8]; } PadCfgRec;
+static void pad_cfg_save(void) {
+    FILE *f = fopen(PAD_CFG, "wb");
+    if (!f) return;
+    uint32_t hdr[2] = { 0x50414443u, 1u };
+    fwrite(hdr, 4, 2, f);
+    for (int i = 0; i < PAD_N; i++) {
+        PadCfgRec r; memset(&r, 0, sizeof r);
+        Pad *p = &g_pad[i];
+        snprintf(r.path, sizeof r.path, "%s", p->d ? p->path : "");
+        r.v[0] = p->vol; r.v[1] = p->pitch; r.v[2] = p->start; r.v[3] = p->mode; r.v[4] = p->a; r.v[5] = p->dc; r.v[6] = p->s; r.v[7] = p->r;
+        fwrite(&r, sizeof r, 1, f);
+    }
+    fclose(f);
+}
+static void pad_cfg_load(void) {
+    for (int i = 0; i < PAD_N; i++) pad_defaults(&g_pad[i]);
+    FILE *f = fopen(PAD_CFG, "rb");
+    if (!f) return;
+    uint32_t hdr[2];
+    if (fread(hdr, 4, 2, f) == 2 && hdr[0] == 0x50414443u && hdr[1] == 1u) {
+        for (int i = 0; i < PAD_N; i++) {
+            PadCfgRec r;
+            if (fread(&r, sizeof r, 1, f) != 1) break;
+            Pad *p = &g_pad[i];
+            int *dst[8] = { &p->vol, &p->pitch, &p->start, &p->mode, &p->a, &p->dc, &p->s, &p->r };
+            static const int mx[8] = { 100, 48, 99, 2, 100, 100, 100, 100 };
+            for (int q = 0; q < 8; q++) *dst[q] = r.v[q] < 0 ? 0 : (r.v[q] > mx[q] ? mx[q] : r.v[q]);
+            r.path[sizeof r.path - 1] = 0;
+            if (r.path[0]) { char e[48]; pad_load_wav(i, r.path, e, sizeof e); }
+        }
+    }
+    fclose(f);
+}
+
 static int open_out(int *channels) {
     int p = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, OUT_GRAIN, OUT_RATE, SCE_AUDIO_OUT_MODE_MONO);
     if (p >= 0) { *channels = 1; return p; }
@@ -846,25 +1087,42 @@ static int out_thread(SceSize args, void *argp) {
         }
 
         if (g_state != ST_PLAYING) {
+            int did = 0, peak = 0;
             /* плавное затухание при паузе/стопе, чтобы не было щелчка */
             if (was_playing && out_port >= 0 && g_length > 1) {
-                int len = g_length, lo = g_lo, hi = g_hi, peak = 0;
+                int len = g_length, lo = g_lo, hi = g_hi;
                 region_sanitize(&lo, &hi, len);
                 Params prm;
                 load_params(&prm, lo, hi);
                 eng.force_fade = 1;
                 engine_render(&eng, g_audio, len, &prm, mono, &peak);
+                did = 1;
+            }
+            /* голоса пэдов звучат и без воспроизведения дорожки */
+            if (pad_busy()) {
+                if (out_port < 0) {
+                    out_port = open_out(&out_ch);
+                    if (out_port >= 0) { g_out_ch = out_ch; out_err = 0; }
+                }
+                if (out_port >= 0) {
+                    if (!did) memset(mono, 0, sizeof(mono));
+                    pad_mix_add(mono, &peak);
+                    did = 1;
+                }
+            }
+            if (did && out_port >= 0) {
                 int16_t *ob = out_bufs[bi];
                 if (out_ch == 1) memcpy(ob, mono, sizeof(mono));
                 else for (int i = 0; i < OUT_GRAIN; i++) { ob[2 * i] = mono[i]; ob[2 * i + 1] = mono[i]; }
                 sceAudioOutOutput(out_port, ob);
                 bi = (bi + 1) % N_OUT_BUFS;
+                g_level = peak;
             }
             was_playing = 0;
             have_prm = 0;
             old_active = 0;
             t_last = 0;
-            sceKernelDelayThread(3000);
+            if (!did) sceKernelDelayThread(3000);
             continue;
         }
 
@@ -936,6 +1194,7 @@ static int out_thread(SceSize args, void *argp) {
             old_active--;
             if (pk2 > peak) peak = pk2;
         }
+        pad_mix_add(mono, &peak);
 
         int16_t *ob = out_bufs[bi];
         if (out_ch == 1) {
@@ -2282,9 +2541,9 @@ enum {
     B_NONE = -1,
     B_CROP, B_UNDO, B_REV, B_NORM,
     B_SL_MINUS, B_SL_PLUS, B_BPM_MINUS, B_BPM_PLUS,
-    B_TAB0, B_TAB1, B_TAB2, B_TAB3, B_TAB4,
+    B_TAB0, B_TAB1, B_TAB2, B_TAB3, B_TAB4, B_TAB5,
     B_ADV0, B_ADV1, B_ADV2, B_ADV3,
-    B_GR_ON, B_FSEC0, B_FSEC1, B_FT0, B_FT1, B_FT2, B_FT3, B_CURVE,
+    B_GR_ON, B_FSEC0, B_FSEC1, B_FT0, B_FT1, B_FT2, B_FT3, B_CURVE, B_PLOAD, B_PMODE,
     B_KNOB0 = 60,
     B_PAD0 = 100
 };
@@ -2318,6 +2577,13 @@ static void pad_geom(int i, int n, int *x, int *y, int *w, int *h) {
     *w = *h = s;
 }
 
+/* сетка пэдов PAD: 4x4 */
+static void pad5_geom(int i, int *x, int *y, int *w, int *h) {
+    *w = (PADS_W - 18) / 4; *h = (PADS_H - 18) / 4;
+    *x = PADS_X + (i % 4) * (*w + 6);
+    *y = PADS_Y + (i / 4) * (*h + 6);
+}
+
 /* ---------- ручки ---------- */
 typedef struct {
     volatile int *v; int n, def;
@@ -2326,9 +2592,9 @@ typedef struct {
     int pages;                /* битовая маска страниц, на которых ручка видна */
     int sec;                  /* страница FX: раздел, в котором ручка видна (-1 = везде) */
 } KnobDef;
-enum { PG_EDIT = 1, PG_SLICE = 2, PG_GRAIN = 4, PG_FX = 8, PG_ADV = 16, PG_ALL = 31 };
-static const int g_tab_page[5] = { 0, 1, 2, 4, 3 };      /* вкладки сверху: EDIT SLICE GRAIN ADV FX -> номер страницы */
-#define N_KNOBS 12
+enum { PG_EDIT = 1, PG_SLICE = 2, PG_GRAIN = 4, PG_FX = 8, PG_ADV = 16, PG_ALL = 31, PG_PAD = 32 };
+static const int g_tab_page[6] = { 0, 1, 2, 4, 3, 5 };      /* вкладки сверху: EDIT SLICE GRAIN ADV FX PAD -> номер страницы */
+#define N_KNOBS 15
 static KnobDef g_kd[N_KNOBS];
 
 static void knobs_init(void) {
@@ -2345,6 +2611,9 @@ static void knobs_init(void) {
         { &g_fx[0],      16,  15, "BIT DEPTH", 470, 448, 30, PG_FX,   1 },
         { &g_fx[1],     101, 100, "SAMPLE RATE", 620, 448, 30, PG_FX, 1 },
         { &g_gr_det,    101,   0, "DETUNE",  728, 436, 28, PG_GRAIN, -1 },
+        { &g_pe_vol,    101,  80, "PAD VOLUME", 60, 438, 26, PG_PAD, -1 },
+        { &g_pe_pitch,   49,  24, "PAD PITCH", 152, 438, 26, PG_PAD, -1 },
+        { &g_pe_start,  100,   0, "START",   244, 438, 26, PG_PAD, -1 },
     };
     memcpy(g_kd, k, sizeof(k));
 }
@@ -2380,13 +2649,16 @@ static void knob_text(int k, char *out, size_t cap) {
     case 8: { int o = (int)(25.0f * powf(16.0f, (float)v / 100.0f) + 0.5f); snprintf(out, cap, "%d.%02d oct", o / 100, o % 100); break; }
     case 9: fx_text(out, cap, 0, v); break;
     case 10: fx_text(out, cap, 1, v); break;
+    case 12: snprintf(out, cap, "%d %%", v); break;
+    case 13: snprintf(out, cap, "%+d st", v - 24); break;
+    case 14: snprintf(out, cap, "%d %%", v); break;
     default: { float d = (float)v / 100.0f; snprintf(out, cap, "%d ct", (int)(1200.0f * d * d + 0.5f)); break; }
     }
 }
 
 /* ---------- геометрия кнопок ---------- */
 static int btn_geom(int id, int *x, int *y, int *w, int *h) {
-    if (id >= B_TAB0 && id <= B_TAB4) { *x = 214 + (id - B_TAB0) * 58; *y = 7; *w = 54; *h = 27; return 1; }
+    if (id >= B_TAB0 && id <= B_TAB5) { *x = 204 + (id - B_TAB0) * 53; *y = 7; *w = 49; *h = 27; return 1; }
     if (id >= B_CROP && id <= B_NORM) { *x = 332 + (id - B_CROP) * 126; *y = 384; *w = 90; *h = 90; return 1; }
     if (id >= B_ADV0 && id <= B_ADV3) { *x = 332 + (id - B_ADV0) * 126; *y = 384; *w = 90; *h = 90; return 1; }
     switch (id) {
@@ -2396,6 +2668,8 @@ static int btn_geom(int id, int *x, int *y, int *w, int *h) {
     case B_BPM_PLUS:  *x = 894; *y = 472; *w = 38; *h = 38; return 1;
     case B_GR_ON:     *x = 840; *y = 392; *w = 90; *h = 90; return 1;
     case B_CURVE:     *x = CURVE_X; *y = CURVE_Y; *w = CURVE_W; *h = CURVE_H; return 1;
+    case B_PLOAD:     *x = 796; *y = 384; *w = 136; *h = 62; return 1;
+    case B_PMODE:     *x = 796; *y = 456; *w = 136; *h = 62; return 1;
     }
     if (id >= B_FSEC0 && id <= B_FSEC1) { *x = 316 + (id - B_FSEC0) * 110; *y = 372; *w = 100; *h = 28; return 1; }
     if (id >= B_FT0 && id <= B_FT3) { int i = id - B_FT0; *x = 690 + (i % 2) * 62; *y = 410 + (i / 2) * 60; *w = 54; *h = 54; return 1; }
@@ -2405,7 +2679,8 @@ static int btn_geom(int id, int *x, int *y, int *w, int *h) {
 /* что под пальцем: кнопка, пад, ручка (B_KNOB0 + номер) */
 static int hit_test(int tx, int ty, int page, int sec, int sl_n) {
     int ids[24], n = 0;
-    ids[n++] = B_TAB0; ids[n++] = B_TAB1; ids[n++] = B_TAB2; ids[n++] = B_TAB3; ids[n++] = B_TAB4;
+    ids[n++] = B_TAB0; ids[n++] = B_TAB1; ids[n++] = B_TAB2; ids[n++] = B_TAB3; ids[n++] = B_TAB4; ids[n++] = B_TAB5;
+    if (page == 5) { ids[n++] = B_PLOAD; ids[n++] = B_PMODE; }
     if (page == 0) { ids[n++] = B_CROP; ids[n++] = B_UNDO; ids[n++] = B_REV; ids[n++] = B_NORM; }
     if (page == 1) { ids[n++] = B_SL_MINUS; ids[n++] = B_SL_PLUS; ids[n++] = B_BPM_MINUS; ids[n++] = B_BPM_PLUS; }
     if (page == 2) ids[n++] = B_GR_ON;
@@ -2416,7 +2691,7 @@ static int hit_test(int tx, int ty, int page, int sec, int sl_n) {
     }
     for (int i = 0; i < n; i++) {
         int x, y, w, h, sx = 0, sy = 0;
-        if (ids[i] >= B_TAB0 && ids[i] <= B_TAB4) { sx = 2; sy = 7; }          /* названия режимов у края экрана - зона нажатия больше */
+        if (ids[i] >= B_TAB0 && ids[i] <= B_TAB5) { sx = 2; sy = 7; }          /* названия режимов у края экрана - зона нажатия больше */
         if (btn_geom(ids[i], &x, &y, &w, &h) && tx >= x - sx && tx < x + w + sx && ty >= y - sy && ty < y + h + sy) return ids[i];
     }
     for (int k = 0; k < N_KNOBS; k++) {
@@ -2429,6 +2704,13 @@ static int hit_test(int tx, int ty, int page, int sec, int sl_n) {
             int x, y, w, h;
             pad_geom(i, sl_n, &x, &y, &w, &h);
             if (tx >= x && tx < x + w && ty >= y && ty < y + h) return B_PAD0 + i;
+        }
+    }
+    if (page == 5) {
+        for (int i = 0; i < 16; i++) {
+            int x, y, w, h;
+            pad5_geom(i, &x, &y, &w, &h);
+            if (tx >= x - 2 && tx < x + w + 2 && ty >= y - 2 && ty < y + h + 2) return B_PAD0 + i;
         }
     }
     return B_NONE;
@@ -2750,6 +3032,163 @@ static void draw_curve(Canvas *c, int cy0) {
     for (int y = 1; y < h; y += 3) cv_rect(c, ox, oy + y, w, 1, RGBA8(0, 0, 0, 42));     /* строки развёртки */
 }
 
+
+/* ====================================================================
+ *  PAD: интерфейс (сетка 4x4, список WAV, огибающая ADSR на экране ЭЛТ)
+ * ==================================================================== */
+#define ENV_X WAVE_X
+#define ENV_Y 106
+#define ENV_W WAVE_W
+#define ENV_H 176
+#define ENV_PX 2.2f                  /* пикселей экрана на единицу времени A / D / R */
+#define ENV_HOLD 130.0f              /* длина участка выдержки */
+#define ENV_L 24.0f
+#define ENV_TOP 16.0f
+#define ENV_BASE (ENV_H - 24.0f)
+#define PL_ROWS 9
+#define PL_MAX 200
+#define PAD_DIR "ux0:data/Sampler"
+typedef struct {
+    int sel, down_mask;
+    int list_open, list_n, list_sel, list_top;
+    char list[PL_MAX][40];
+    int cfg_dirty, cfg_cnt;
+} PadUi;
+static PadUi g_pu;
+static const char *const g_pmode_name[3] = { "ONE-SHOT", "GATE", "LOOP" };
+
+static void pad_mark_dirty(void) { g_pu.cfg_dirty = 1; g_pu.cfg_cnt = 0; }
+
+/* значения ручек <-> выбранный пад (по теневой копии: двойной тап по ручке тоже записывается) */
+static void pad_sync(void) {
+    static int sh[3], sh_sel = -1;
+    Pad *p = &g_pad[g_pu.sel];
+    if (g_pu.sel != sh_sel) {
+        g_pe_vol = p->vol; g_pe_pitch = p->pitch; g_pe_start = p->start;
+        sh[0] = p->vol; sh[1] = p->pitch; sh[2] = p->start;
+        sh_sel = g_pu.sel;
+        return;
+    }
+    int ev = g_pe_vol, ep = g_pe_pitch, es = g_pe_start;
+    if (ev != sh[0] || ep != sh[1] || es != sh[2]) {
+        p->vol = ev; p->pitch = ep; p->start = es;
+        sh[0] = ev; sh[1] = ep; sh[2] = es;
+        pad_mark_dirty();
+    } else {                                           /* пад поменялся не от ручки (загрузка) - подтянуть */
+        if (p->vol != ev || p->pitch != ep || p->start != es) {
+            g_pe_vol = p->vol; g_pe_pitch = p->pitch; g_pe_start = p->start;
+            sh[0] = p->vol; sh[1] = p->pitch; sh[2] = p->start;
+        }
+    }
+}
+
+static int pl_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
+static void pad_list_scan(void) {
+    g_pu.list_n = 0;
+    SceUID d = sceIoDopen(PAD_DIR);
+    if (d >= 0) {
+        SceIoDirent e;
+        memset(&e, 0, sizeof(e));
+        while (sceIoDread(d, &e) > 0 && g_pu.list_n < PL_MAX) {
+            size_t n = strlen(e.d_name);
+            if (n > 4 && n < 39 && strcasecmp(e.d_name + n - 4, ".wav") == 0)
+                snprintf(g_pu.list[g_pu.list_n++], 40, "%s", e.d_name);
+            memset(&e, 0, sizeof(e));
+        }
+        sceIoDclose(d);
+    }
+    qsort(g_pu.list, (size_t)g_pu.list_n, 40, pl_cmp);
+}
+
+/* ---- огибающая: точки в координатах холста ---- */
+static void env_points(const Pad *p, float *px, float *py) {
+    float ys = ENV_BASE - (ENV_BASE - ENV_TOP) * (float)p->s / 100.0f;
+    px[0] = ENV_L;                         py[0] = ENV_BASE;
+    px[1] = px[0] + (float)p->a * ENV_PX;  py[1] = ENV_TOP;
+    px[2] = px[1] + (float)p->dc * ENV_PX; py[2] = ys;
+    px[3] = px[2] + ENV_HOLD;              py[3] = ys;
+    px[4] = px[3] + (float)p->r * ENV_PX;  py[4] = ENV_BASE;
+}
+static int env_clamp(float v) { return v < 0.0f ? 0 : (v > 100.0f ? 100 : (int)(v + 0.5f)); }
+/* перетаскивание ручки огибающей: k = 0 атака, 1 спад + уровень, 2 затухание; x, y - экранные */
+static void env_drag(int k, float x, float y) {
+    Pad *p = &g_pad[g_pu.sel];
+    float cx = x - ENV_X, cy = y - ENV_Y, px[5], py[5];
+    env_points(p, px, py);
+    if (k == 0) p->a = env_clamp((cx - px[0]) / ENV_PX);
+    else if (k == 1) {
+        p->dc = env_clamp((cx - px[1]) / ENV_PX);
+        p->s = env_clamp(100.0f * (ENV_BASE - cy) / (ENV_BASE - ENV_TOP));
+    } else p->r = env_clamp((cx - px[3]) / ENV_PX);
+    pad_mark_dirty();
+}
+/* ближайшая ручка огибающей к точке экрана: 0..2 или -1 */
+static int env_pick(float x, float y) {
+    const Pad *p = &g_pad[g_pu.sel];
+    float px[5], py[5];
+    env_points(p, px, py);
+    static const int idx[3] = { 1, 2, 4 };
+    int best = -1; float bd = 40.0f * 40.0f;
+    for (int k = 0; k < 3; k++) {
+        float dx = x - (float)ENV_X - px[idx[k]], dy = y - (float)ENV_Y - py[idx[k]], d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = k; }
+    }
+    return best;
+}
+
+static void env_render(Canvas *c, const Pad *p) {
+    cv_clear(c, 0);
+    for (int x = 0; x < c->w; x += 8) {                       /* линии сетки */
+        cv_rect(c, x, (int)ENV_BASE, 4, 1, RGBA8(255, 150, 46, 60));
+        cv_rect(c, x, (int)ENV_TOP, 4, 1, RGBA8(255, 150, 46, 34));
+    }
+    if (p->d) {                                                /* волна сэмпла под огибающей */
+        float mid = (ENV_BASE + ENV_TOP) * 0.5f, amp = (ENV_BASE - ENV_TOP) * 0.5f;
+        for (int i = 0; i < PAD_PK; i++) {
+            int hh = (int)((float)p->pk[i] / 255.0f * amp);
+            cv_rect(c, i * c->w / PAD_PK, (int)mid - hh, 3, 2 * hh + 1, RGBA8(255, 170, 70, 62));
+        }
+        int sx = (int)((float)c->w * (float)p->start / 100.0f);
+        cv_rect(c, sx, (int)ENV_TOP - 6, 1, (int)(ENV_BASE - ENV_TOP) + 12, RGBA8(120, 230, 140, 200));
+        cv_rect(c, sx, (int)ENV_TOP - 6, 7, 3, RGBA8(120, 230, 140, 200));
+    }
+    float px[5], py[5];
+    env_points(p, px, py);
+    for (int x = (int)px[0]; x <= (int)px[4]; x++) {           /* заливка под кривой */
+        float y = py[4];
+        for (int k = 0; k < 4; k++)
+            if ((float)x >= px[k] && (float)x <= px[k + 1]) {
+                float t = px[k + 1] > px[k] ? ((float)x - px[k]) / (px[k + 1] - px[k]) : 1.0f;
+                y = py[k] + (py[k + 1] - py[k]) * t;
+                break;
+            }
+        cv_rect(c, x, (int)y, 1, (int)(ENV_BASE - y) + 1, RGBA8(233, 106, 38, 54));
+    }
+    for (int k = 0; k < 4; k++) cv_line(c, px[k], py[k], px[k + 1], py[k + 1], 1.5f, RGBA8(255, 214, 128, 255));
+    static const int idx[3] = { 1, 2, 4 };
+    for (int k = 0; k < 3; k++) {                              /* ручки A, D(+S), R */
+        cv_circle(c, px[idx[k]], py[idx[k]], 8.0f, RGBA8(40, 22, 10, 255));
+        cv_ring(c, px[idx[k]], py[idx[k]], 8.0f, 2.0f, RGBA8(255, 224, 120, 255));
+        cv_circle(c, px[idx[k]], py[idx[k]], 3.0f, RGBA8(255, 150, 46, 255));
+    }
+}
+
+/* клавиша-пад 113x33: нажатый или выбранный залипает, оранжевый - выбранный, точка - сэмпл назначен (ярче - звучит) */
+static void cv_padcell(Canvas *c, int x, int y, int w, int h, int sel, int pr, int has, int play) {
+    uint32_t top = RGBA8(249, 245, 232, 255), bot = RGBA8(219, 213, 195, 255), edge = RGBA8(150, 142, 120, 255), side = RGBA8(170, 162, 140, 255);
+    if (sel) { top = K_ORANGE_HI; bot = K_ORANGE; edge = K_ORANGE_LO; side = RGBA8(150, 58, 12, 255); }
+    int off = pr ? 2 : 0;
+    if (!pr) cv_rrect(c, (float)x, (float)(y + 3), (float)w, (float)h, 4.0f, side);
+    if (pr) { uint32_t t = top; top = bot; bot = t; }
+    cv_rrect_grad(c, (float)x, (float)(y + off), (float)w, (float)h, 4.0f, top, bot);
+    cv_rrect_stroke(c, (float)x, (float)(y + off), (float)w, (float)h, 4.0f, 1.0f, edge);
+    if (!pr) cv_rrect(c, (float)(x + 4), (float)y + 1.5f, (float)(w - 8), 1.2f, 0.6f, RGBA8(255, 255, 255, 110));
+    if (has) {
+        cv_circle(c, (float)(x + w - 10), (float)(y + off + 10), 4.4f, RGBA8(60, 40, 20, 255));
+        cv_circle(c, (float)(x + w - 10), (float)(y + off + 10), 3.2f, play ? RGBA8(255, 226, 90, 255) : RGBA8(70, 170, 90, 255));
+    }
+}
+
 static int edit_style(const UiState *u, int id) {
     if (id == B_CROP && u->crop_armed) return 1;
     if (id == B_REV && u->rev) return 1;
@@ -2860,7 +3299,32 @@ static int ctl_update(Canvas *c, const UiState *u) {
                 changed = 1;
             }
         }
-    } else if (u->fx_sec == 0) {
+    } else if (page == 5) {
+        for (int i = 0; i < PAD_N; i++) {
+            int x, y, w, h;
+            pad5_geom(i, &x, &y, &w, &h);
+            int has = g_pad[i].d != NULL, pl = (g_pad_mask >> i) & 1, dn = (g_pu.down_mask >> i) & 1, sl = (g_pu.sel == i);
+            int code = 1 + sl * 2 + has * 4 + pl * 8 + dn * 16;
+            if (code != g_wcode[W_PAD0 + i]) {
+                cv_clear_part(c, x, y - CTL_TY, w, h);
+                cv_padcell(c, x, y - CTL_TY, w, h, sl, sl || dn, has, pl);
+                g_wcode[W_PAD0 + i] = code;
+                changed = 1;
+            }
+        }
+        for (int k = 0; k < 2; k++) {
+            int id = k ? B_PMODE : B_PLOAD;
+            int code = 1 + 4 * (u->btn_down == id) + (k ? 8 * g_pad[g_pu.sel].mode : 2 * g_pu.list_open);
+            if (code != g_wcode[W_SIDE0 + k]) {
+                int x, y, w, h;
+                btn_geom(id, &x, &y, &w, &h);
+                cv_clear_part(c, x, y - CTL_TY, w, h);
+                cv_key(c, x, y - CTL_TY, w, h, 0, (u->btn_down == id) || (k == 0 && g_pu.list_open));
+                g_wcode[W_SIDE0 + k] = code;
+                changed = 1;
+            }
+        }
+    } else if (page == 3 && u->fx_sec == 0) {
         for (int i = 0; i < 4; i++) {
             int sel = (u->flt_type == i);
             int code = 1 + sel + 4 * (u->btn_down == B_FT0 + i);
@@ -2897,12 +3361,15 @@ static int ctl_update(Canvas *c, const UiState *u) {
  *  Текстуры интерфейса и их обновление
  * ==================================================================== */
 static vita2d_texture *g_tex_bg = NULL, *g_tex_top[2], *g_tex_ctl[3], *g_tex_glass = NULL, *g_tex_meter = NULL;
-static Canvas g_cv_bg, g_cv_top, g_cv_glass, g_cv_page[5];     /* панель управления: по холсту на страницу */
-static int g_wcodes[5][W_COUNT], g_page_keys[5] = { -1, -1, -1, -1, -1 }, g_last_page = -1, g_last_key = -1;
+static Canvas g_cv_bg, g_cv_top, g_cv_glass, g_cv_page[6];     /* панель управления: по холсту на страницу */
+static int g_wcodes[6][W_COUNT], g_page_keys[6] = { -1, -1, -1, -1, -1, -1 }, g_last_page = -1, g_last_key = -1;
 static uint32_t g_sig_top = 0;
 static int g_top_cur = -1, g_ctl_cur = -1, g_top_next = 0, g_ctl_next = 0;
 
-static Canvas g_cv_meter, g_cv_mglass;
+static Canvas g_cv_meter, g_cv_mglass, g_cv_env;
+static vita2d_texture *g_tex_env[2];
+static int g_env_cur = -1, g_env_next = 0;
+static uint32_t g_sig_env = 0;
 static vita2d_texture *g_tex_mglass = NULL;
 
 static void upload_canvas(vita2d_texture *tex, const Canvas *c) {
@@ -2923,6 +3390,8 @@ static void ui_create_textures(void) {
     for (int i = 0; i < 3; i++) g_tex_ctl[i] = vita2d_create_empty_texture(SCR_W, CTL_TH);
     upload_canvas(g_tex_bg, &g_cv_bg);
     upload_canvas(g_tex_glass, &g_cv_glass);
+    for (int i = 0; i < 2; i++) g_tex_env[i] = vita2d_create_empty_texture(ENV_W, ENV_H);
+    g_env_cur = -1; g_sig_env = 0;
     g_sig_top = 0xFFFFFFFFu;
     g_top_cur = g_ctl_cur = -1;
     g_last_page = -1; g_last_key = -1;
@@ -2934,19 +3403,21 @@ static int ui_init(void) {
     g_cv_bg.w = SCR_W; g_cv_bg.h = SCR_H; g_cv_bg.px = (uint32_t *)malloc((size_t)SCR_W * SCR_H * 4);
     g_cv_top.w = SCR_W; g_cv_top.h = TOP_H; g_cv_top.px = (uint32_t *)malloc((size_t)SCR_W * TOP_H * 4);
     g_cv_glass.w = GL_W; g_cv_glass.h = GL_H; g_cv_glass.px = (uint32_t *)calloc((size_t)GL_W * GL_H, 4);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         g_cv_page[i].w = SCR_W; g_cv_page[i].h = CTL_TH;
         g_cv_page[i].px = (uint32_t *)calloc((size_t)SCR_W * CTL_TH, 4);
         g_page_keys[i] = -1;
     }
     if (!g_cv_bg.px || !g_cv_top.px || !g_cv_glass.px) return 0;
-    for (int i = 0; i < 5; i++) if (!g_cv_page[i].px) return 0;
+    for (int i = 0; i < 6; i++) if (!g_cv_page[i].px) return 0;
     g_cv_meter.w = METER_W; g_cv_meter.h = METER_H; g_cv_meter.px = (uint32_t *)calloc((size_t)METER_W * METER_H, 4);
     if (!g_cv_meter.px) return 0;
     meter_render(&g_cv_meter);
     g_cv_mglass.w = METER_W + 8; g_cv_mglass.h = METER_H + 8; g_cv_mglass.px = (uint32_t *)calloc((size_t)(METER_W + 8) * (METER_H + 8), 4);
     if (!g_cv_mglass.px) return 0;
     meter_glass_render(&g_cv_mglass);
+    g_cv_env.w = ENV_W; g_cv_env.h = ENV_H; g_cv_env.px = (uint32_t *)calloc((size_t)ENV_W * ENV_H, 4);
+    if (!g_cv_env.px) return 0;
     skin_render_static(&g_cv_bg);
     glass_render(&g_cv_glass);
     ui_create_textures();
@@ -2960,6 +3431,7 @@ static void ui_free_textures(void) {
     if (g_tex_mglass) { vita2d_free_texture(g_tex_mglass); g_tex_mglass = NULL; }
     for (int i = 0; i < 2; i++) if (g_tex_top[i]) { vita2d_free_texture(g_tex_top[i]); g_tex_top[i] = NULL; }
     for (int i = 0; i < 3; i++) if (g_tex_ctl[i]) { vita2d_free_texture(g_tex_ctl[i]); g_tex_ctl[i] = NULL; }
+    for (int i = 0; i < 2; i++) if (g_tex_env[i]) { vita2d_free_texture(g_tex_env[i]); g_tex_env[i] = NULL; }
 }
 
 /* после "сна" видеопамять могла обнулиться - создаём текстуры заново */
@@ -2981,6 +3453,18 @@ static void ui_update_textures(const UiState *u) {
         top_render(&g_cv_top, u);
         g_top_cur = g_top_next; g_top_next = (g_top_next + 1) % 2;
         upload_canvas(g_tex_top[g_top_cur], &g_cv_top);
+    }
+    if (u->page == 5) {                                    /* огибающая пада: перерисовывается только при изменении */
+        const Pad *p = &g_pad[g_pu.sel];
+        uint32_t h = 2166136261u;
+        int vals[10] = { g_pu.sel, p->a, p->dc, p->s, p->r, p->start, p->n, (int)(uintptr_t)p->d, p->mode, p->loading };
+        for (int i = 0; i < 10; i++) h = sig_add(h, (uint32_t)vals[i]);
+        if (h != g_sig_env || g_env_cur < 0) {
+            g_sig_env = h;
+            env_render(&g_cv_env, p);
+            g_env_cur = g_env_next; g_env_next = (g_env_next + 1) % 2;
+            upload_canvas(g_tex_env[g_env_cur], &g_cv_env);
+        }
     }
     {   /* у каждой страницы свой холст: при переключении ничего не перерисовывается заново */
         int page = u->page;
@@ -3159,23 +3643,76 @@ static void draw_grain_viz(const UiState *u) {
     }
 }
 
+static void trunc_name(char *dst, size_t cap, const char *src, int maxc) {
+    snprintf(dst, cap, "%s", src);
+    if ((int)strlen(dst) > maxc) { dst[maxc - 1] = '.'; dst[maxc] = 0; }
+}
+
+/* экран ЭЛТ на странице PAD: заголовок, волна сэмпла и огибающая с ручками */
+static void draw_pad_crt(const UiState *u) {
+    const Pad *p = &g_pad[g_pu.sel];
+    char buf[200], nm[48];
+    snprintf(buf, sizeof(buf), "PAD %02d", g_pu.sel + 1);
+    text_m(WAVE_X, 90, K_AMBER, 1.5f, buf);
+    if (p->d) { trunc_name(nm, sizeof(nm), p->name, 34); text(WAVE_X + 190, 76, K_AMBER_LT, 0.72f, nm); }
+    else text(WAVE_X + 190, 76, K_AMBER_DIM, 0.72f, "empty - press LOAD to pick a WAV");
+    if (p->d) {
+        int tenth = (int)((int64_t)p->n * 10 / (p->rate > 0 ? p->rate : 1));
+        snprintf(buf, sizeof(buf), "%d.%d s   %d Hz   %s", tenth / 10, tenth % 10, p->rate, g_pmode_name[p->mode]);
+    } else snprintf(buf, sizeof(buf), "%s", g_pmode_name[p->mode]);
+    text(WAVE_X + 190, 91, K_AMBER_DIM, 0.62f, buf);
+    if (g_env_cur >= 0 && g_tex_env[g_env_cur]) vita2d_draw_texture(g_tex_env[g_env_cur], ENV_X, ENV_Y);
+    float px[5], py[5];
+    env_points(p, px, py);
+    text_c(ENV_X + (int)px[1], ENV_Y + (int)py[1] - 14, K_AMBER_LT, 0.55f, "A");
+    text_c(ENV_X + (int)px[2], ENV_Y + (int)py[2] - 14, K_AMBER_LT, 0.55f, "D S");
+    text_c(ENV_X + (int)px[4], ENV_Y + (int)py[4] - 14, K_AMBER_LT, 0.55f, "R");
+    snprintf(buf, sizeof(buf), "ATTACK %d ms    DECAY %d ms    SUSTAIN %d %%    RELEASE %d ms     drag the round handles",
+             (int)pad_ms(p->a), (int)pad_ms(p->dc), p->s, (int)pad_ms(p->r));
+    text(WAVE_X, 312, K_AMBER_DIM, 0.72f, buf);
+}
+
+/* список WAV поверх экрана: стрелки + X, или касание строки */
+static void draw_pad_list(void) {
+    rect(CRT_X + 4, CRT_Y + 4, CRT_W - 8, CRT_H - 8, RGBA8(22, 14, 8, 252));
+    rect_outline(CRT_X + 4, CRT_Y + 4, CRT_W - 8, CRT_H - 8, 2, K_ORANGE_LO);
+    char buf[120];
+    snprintf(buf, sizeof(buf), "WAV FOR PAD %02d    folder ux0:data/Sampler    (UP/DOWN + X = assign, O = close, drag = scroll)", g_pu.sel + 1);
+    text(CRT_X + 16, CRT_Y + 26, K_YELLOW, 0.68f, buf);
+    if (g_pu.list_n == 0) {
+        text(CRT_X + 16, CRT_Y + 70, K_AMBER_LT, 0.8f, "no .wav files yet: record something and press START to save it");
+        return;
+    }
+    for (int i = 0; i < PL_ROWS; i++) {
+        int k = g_pu.list_top + i;
+        if (k >= g_pu.list_n) break;
+        int y = CRT_Y + 38 + i * 23;
+        if (k == g_pu.list_sel) rect(CRT_X + 12, y, CRT_W - 36, 22, RGBA8(255, 150, 46, 60));
+        text(CRT_X + 20, y + 16, k == g_pu.list_sel ? K_AMBER : K_AMBER_LT, 0.72f, g_pu.list[k]);
+    }
+    int sbh = 200 * PL_ROWS / (g_pu.list_n > PL_ROWS ? g_pu.list_n : PL_ROWS);
+    int sby = CRT_Y + 38 + (g_pu.list_n > PL_ROWS ? (200 - sbh) * g_pu.list_top / (g_pu.list_n - PL_ROWS) : 0);
+    rect(CRT_X + CRT_W - 18, CRT_Y + 38, 3, 230, RGBA8(255, 150, 46, 30));
+    rect(CRT_X + CRT_W - 19, sby, 5, sbh, RGBA8(255, 170, 70, 200));
+}
+
 static void ui_draw(const UiState *u) {
     char buf[200], t1[32];
-    static const char *page_name[5] = { "EDIT", "SLICE", "GRAIN", "ADV", "FX" };
+    static const char *page_name[6] = { "EDIT", "SLICE", "GRAIN", "ADV", "FX", "PAD" };
 
     vita2d_draw_texture(g_tex_bg, 0, 0);
     if (g_top_cur >= 0) vita2d_draw_texture(g_tex_top[g_top_cur], 0, 0);
 
     /* верхняя планка */
     text(50, 22, K_BROWN, 1.1f, "VITA SAMPLER");
-    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.4");
+    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.5");
     text(560, 26, K_BROWN, 0.62f, "REC");
     text(648, 26, K_BROWN, 0.62f, "PLAY");
     text(736, 26, K_BROWN, 0.62f, "LOOP");
     text(774, 26, K_BROWN, 0.62f, "BPM");
 
     /* названия режимов: просто текст, выбранный обведён */
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         int x, y, w, h;
         btn_geom(B_TAB0 + i, &x, &y, &w, &h);
         int sel = (u->page == g_tab_page[i]);
@@ -3186,6 +3723,8 @@ static void ui_draw(const UiState *u) {
         text_c(x + w / 2, y + h / 2 + 5, sel ? K_BROWN : K_BROWN_LO, 0.74f, page_name[i]);
     }
 
+    if (u->page == 5) draw_pad_crt(u);
+    else {
     /* окно ЭЛТ: время, номер сэмпла, уровень */
     int shown = u->live ? u->length : u->playhead;
     fmt_time(t1, sizeof(t1), shown);
@@ -3240,7 +3779,10 @@ static void ui_draw(const UiState *u) {
         snprintf(buf, sizeof(buf), "scrub speed %d%%", (int)(fabs(u->scrub_speed) / (double)SAMPLE_RATE * 100.0 + 0.5));
         text(WAVE_X + WAVE_W - 150, 312, K_AMBER, 0.72f, buf);
     }
+    }
     text(WAVE_X, 329, u->confirm ? K_YELLOW : K_AMBER_LT, 0.82f, u->msg);
+
+    if (u->page == 5 && g_pu.list_open) draw_pad_list();
 
     /* справка поверх экрана */
     if (u->legend) {
@@ -3340,6 +3882,25 @@ static void ui_draw(const UiState *u) {
         text(796, 390, K_BROWN, 0.66f, "SLICES");
         text(796, 466, u->bpm_t != u->bpm_b ? K_ORANGE_LO : K_BROWN, 0.66f, "BPM");
         if (u->bpm > 0) { snprintf(buf, sizeof(buf), "orig %d", u->bpm_b); text(850, 466, K_BROWN_LO, 0.55f, buf); }
+    } else if (u->page == 5) {
+        for (int i = 0; i < PAD_N; i++) {
+            int x, y, w, h;
+            pad5_geom(i, &x, &y, &w, &h);
+            int sl = (g_pu.sel == i), pr = sl || ((g_pu.down_mask >> i) & 1), off = pr ? 2 : 0;
+            char nb[8], nm[24];
+            snprintf(nb, sizeof(nb), "%d", i + 1);
+            text(x + 7, y + 14 + off, sl ? K_CREAM_HI : K_BROWN, 0.6f, nb);
+            if (g_pad[i].d) {
+                trunc_name(nm, sizeof(nm), g_pad[i].name, 11);
+                text(x + 7, y + 27 + off, sl ? K_CREAM_HI : K_BROWN_LO, 0.5f, nm);
+            }
+        }
+        int lp = (u->btn_down == B_PLOAD) || g_pu.list_open, mp = (u->btn_down == B_PMODE);
+        text_c(864, 410 + (lp ? 2 : 0), K_BROWN, 0.75f, "LOAD WAV");
+        text_c(864, 427 + (lp ? 2 : 0), K_BROWN_LO, 0.5f, "pick a file for this pad");
+        text_c(864, 480 + (mp ? 2 : 0), K_BROWN_LO, 0.55f, "MODE");
+        text_c(864, 500 + (mp ? 2 : 0), K_BROWN, 0.78f, g_pmode_name[g_pad[g_pu.sel].mode]);
+        text(316, 530, K_BROWN_LO, 0.5f, "pad = touch or X     D-pad = select pad     ENVELOPE: drag the handles on the screen");
     } else if (u->page == 2) {
         text_c(885, 461 + (((u->btn_down == B_GR_ON) || u->gr_on) ? 2 : 0), K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
         text_c(885, 504, K_BROWN, 0.55f, "same pitch and speed,");
@@ -3469,6 +4030,10 @@ typedef struct {
     double drag_x0[3], drag_spp[3], drag_c0[3], drag_c1_0, drag_c2_0;
     int pz_on, pz_id[2];                         /* зум двумя пальцами по волне */
     double pz_d0, pz_len0, pz_cs;
+    int pt_id[4], pt_pad[4];                     /* касания / кнопка X, держащие пады PAD (-1 свободно, -2 кнопка X) */
+    int ph_on, ph_id, ph_k;                      /* ручка огибающей */
+    int ls_on, ls_id, ls_moved; double ls_y0; int ls_top0;   /* прокрутка списка WAV */
+    int ls_rep; double ls_fx, ls_fy;
 } App;
 static App A;
 
@@ -3632,6 +4197,7 @@ static void act_loop_toggle(void) {
 static void act_tab(int t) {
     if (t == 0 || t == 2 || t == 4) { act_set_mode(0); if (g_mode == 0) A.page = t; }   /* GRAIN работает по области A-B (вся дорожка или выбранная), слайсы не мешают */
     else if (t == 1) { act_set_mode(1); if (g_mode == 1) A.page = 1; }
+    else if (t == 5) A.page = 5;                       /* PAD не зависит от режима EDIT / SLICE */
     else A.page = t;
     A.knob_on = 0; A.curve_on = 0;
 }
@@ -3639,9 +4205,9 @@ static void act_tab(int t) {
 /* SELECT + стрелки: соседняя вкладка в том порядке, как они стоят сверху */
 static void act_tab_step(int d) {
     int idx = 0;
-    for (int i = 0; i < 5; i++) if (g_tab_page[i] == A.page) idx = i;
+    for (int i = 0; i < 6; i++) if (g_tab_page[i] == A.page) idx = i;
     idx += d;
-    if (idx < 0 || idx > 4) return;
+    if (idx < 0 || idx > 5) return;
     act_tab(g_tab_page[idx]);
 }
 
@@ -4063,8 +4629,59 @@ static void slice_nudge(int idx, int delta) {
     apply_region();
 }
 
+/* ---- PAD: действия ---- */
+static void pad_press(int id, int i) {
+    int slot = -1;
+    for (int k = 0; k < 4; k++) if (A.pt_id[k] == -1) { slot = k; break; }
+    g_pu.sel = i;
+    g_pad_trig[i]++;
+    if (slot >= 0) { A.pt_id[slot] = id; A.pt_pad[slot] = i; g_pu.down_mask |= 1 << i; }
+    else g_pad_rel[i]++;
+}
+static void pad_release_slot(int slot) {
+    int i = A.pt_pad[slot];
+    A.pt_id[slot] = -1;
+    g_pad_rel[i]++;
+    int still = 0;
+    for (int k = 0; k < 4; k++) if (A.pt_id[k] != -1 && A.pt_pad[k] == i) still = 1;
+    if (!still) g_pu.down_mask &= ~(1 << i);
+}
+static void pad_tap(int i) { g_pu.sel = i; g_pad_trig[i]++; g_pad_rel[i]++; }
+
+static void pad_list_open(void) {
+    pad_list_scan();
+    g_pu.list_sel = 0;
+    for (int i = 0; i < g_pu.list_n; i++) {                     /* текущий файл пада сразу выделен */
+        char full[200];
+        snprintf(full, sizeof(full), "%s/%s", PAD_DIR, g_pu.list[i]);
+        if (strcmp(full, g_pad[g_pu.sel].path) == 0) g_pu.list_sel = i;
+    }
+    g_pu.list_top = g_pu.list_sel > PL_ROWS - 1 ? g_pu.list_sel - PL_ROWS + 1 : 0;
+    g_pu.list_open = 1;
+    snprintf(msg, sizeof(msg), "Pick a WAV for pad %d", g_pu.sel + 1);
+}
+static void pad_assign(int k) {
+    if (k < 0 || k >= g_pu.list_n) return;
+    char path[200], err[64];
+    snprintf(path, sizeof(path), "%s/%s", PAD_DIR, g_pu.list[k]);
+    if (pad_load_wav(g_pu.sel, path, err, sizeof(err))) {
+        snprintf(msg, sizeof(msg), "Pad %d: %s", g_pu.sel + 1, g_pad[g_pu.sel].name);
+        pad_mark_dirty();
+        g_pu.list_open = 0;
+        pad_tap(g_pu.sel);                                         /* сразу прослушать */
+    } else snprintf(msg, sizeof(msg), "Pad %d: %s", g_pu.sel + 1, err);
+}
+static void pad_list_move(int d) {
+    if (g_pu.list_n <= 0) return;
+    g_pu.list_sel += d;
+    if (g_pu.list_sel < 0) g_pu.list_sel = 0;
+    if (g_pu.list_sel >= g_pu.list_n) g_pu.list_sel = g_pu.list_n - 1;
+    if (g_pu.list_sel < g_pu.list_top) g_pu.list_top = g_pu.list_sel;
+    if (g_pu.list_sel >= g_pu.list_top + PL_ROWS) g_pu.list_top = g_pu.list_sel - PL_ROWS + 1;
+}
+
 static void perform_hit(int hit) {
-    if (hit >= B_TAB0 && hit <= B_TAB4) act_tab(g_tab_page[hit - B_TAB0]);
+    if (hit >= B_TAB0 && hit <= B_TAB5) act_tab(g_tab_page[hit - B_TAB0]);
     else if (hit == B_ADV0) act_adv_delete();
     else if (hit == B_ADV1) act_adv_silence();
     else if (hit == B_ADV2) act_adv_duplicate();
@@ -4084,7 +4701,15 @@ static void perform_hit(int hit) {
         g_flt_type = hit - B_FT0;
         snprintf(msg, sizeof(msg), "%s", nm[g_flt_type]);
     }
-    else if (hit >= B_PAD0) act_slice_trigger(hit - B_PAD0);
+    else if (hit == B_PLOAD) { if (g_pu.list_open) g_pu.list_open = 0; else pad_list_open(); }
+    else if (hit == B_PMODE) {
+        Pad *p = &g_pad[g_pu.sel];
+        p->mode = (p->mode + 1) % 3;
+        static const char *mt[3] = { "ONE-SHOT: plays to the end, release is ignored", "GATE: sound while the pad is held, then RELEASE", "LOOP: repeats while held, then RELEASE" };
+        snprintf(msg, sizeof(msg), "%s", mt[p->mode]);
+        pad_mark_dirty();
+    }
+    else if (hit >= B_PAD0) { if (A.page == 5) pad_tap(hit - B_PAD0); else act_slice_trigger(hit - B_PAD0); }
 }
 
 /* ====================================================================
@@ -4111,7 +4736,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v1.3");
+    dbg_log("start v1.5");
 
     g_audio = (int16_t *)malloc(MAX_SAMPLES * sizeof(int16_t));
     if (!g_audio) { dbg_log("malloc failed"); sceKernelExitProcess(0); }
@@ -4132,6 +4757,8 @@ int main(void) {
     memset(&A, 0, sizeof(A));
     A.scrub_id = -1; A.btn_down = -1; A.btn_id = -1; A.knob_last_k = -1; A.knob_id = -1; A.curve_id = -1;
     for (int i = 0; i < 6; i++) A.prev_ids[i] = -1;
+    for (int i = 0; i < 4; i++) A.pt_id[i] = -1;
+    pad_cfg_load();
 
     /* восстановить прошлую сессию, если она есть */
     {
@@ -4332,7 +4959,25 @@ int main(void) {
             A.l_frames = 0;
         } else A.l_frames = 0;
         if (pressed & SCE_CTRL_SQUARE)   act_loop_toggle();
-        if (pressed & SCE_CTRL_CIRCLE)   act_fx_toggle();
+        for (int q = 0; q < 4; q++)                              /* X отпущена - отпускаем пад */
+            if (A.pt_id[q] == -2 && !(pad.buttons & SCE_CTRL_CROSS)) pad_release_slot(q);
+        if (A.page == 5 && !(pad.buttons & SCE_CTRL_SELECT)) {
+            if (g_pu.list_open) {
+                int ud = ((pad.buttons & SCE_CTRL_DOWN) ? 1 : 0) - ((pad.buttons & SCE_CTRL_UP) ? 1 : 0);
+                if (ud) { A.ls_rep++; if (A.ls_rep == 1 || (A.ls_rep > 15 && A.ls_rep % 3 == 0)) pad_list_move(ud); }
+                else A.ls_rep = 0;
+                if (pressed & SCE_CTRL_CROSS) pad_assign(g_pu.list_sel);
+            } else {
+                int sx = g_pu.sel % 4, sy = g_pu.sel / 4;
+                if (pressed & SCE_CTRL_LEFT)  sx = (sx + 3) % 4;
+                if (pressed & SCE_CTRL_RIGHT) sx = (sx + 1) % 4;
+                if (pressed & SCE_CTRL_UP)    sy = (sy + 3) % 4;
+                if (pressed & SCE_CTRL_DOWN)  sy = (sy + 1) % 4;
+                g_pu.sel = sy * 4 + sx;
+                if (pressed & SCE_CTRL_CROSS) pad_press(-2, g_pu.sel);
+            }
+        }
+        if (pressed & SCE_CTRL_CIRCLE) { if (A.page == 5 && g_pu.list_open) g_pu.list_open = 0; else act_fx_toggle(); }
 
         /* Треугольник: стоп; удержание - позиция сохраняется */
         if (pressed & SCE_CTRL_TRIANGLE) {
@@ -4362,7 +5007,7 @@ int main(void) {
         double spp = (double)view_len / (double)WAVE_W;
         if (spp < 0.05) spp = 0.05;
 
-        if (state != ST_RECORDING && length > 1) {
+        if (state != ST_RECORDING && length > 1 && A.page != 5) {
             if (g_mode == 0) {
                 float a1 = stick_axis(pad.lx);
                 float a2 = stick_axis(pad.rx);
@@ -4516,7 +5161,20 @@ int main(void) {
             for (int j = 0; j < A.prev_n; j++) if (A.prev_ids[j] == id) is_new = 0;
             if (!is_new) continue;
             double fx = touch.report[k].x / 2.0, fy = touch.report[k].y / 2.0;
-            int in_wave = (fx >= WAVE_X - 4 && fx <= WAVE_X + WAVE_W + 4 && fy >= WAVE_Y - 18 && fy <= WAVE_Y + WAVE_H + 18);
+            int in_wave = (A.page != 5 && fx >= WAVE_X - 4 && fx <= WAVE_X + WAVE_W + 4 && fy >= WAVE_Y - 18 && fy <= WAVE_Y + WAVE_H + 18);
+
+            if (A.page == 5) {                                    /* PAD: список WAV, ручки огибающей, пады */
+                if (g_pu.list_open && fx >= CRT_X && fx < CRT_X + CRT_W && fy >= CRT_Y && fy < CRT_Y + CRT_H) {
+                    if (!A.ls_on) { A.ls_on = 1; A.ls_id = id; A.ls_y0 = fy; A.ls_moved = 0; A.ls_top0 = g_pu.list_top; }
+                    continue;
+                }
+                if (!A.ph_on && !g_pu.list_open && fx >= ENV_X - 12 && fx <= ENV_X + ENV_W + 12 && fy >= ENV_Y - 14 && fy <= ENV_Y + ENV_H + 8) {
+                    int pk = env_pick((float)fx, (float)fy);
+                    if (pk >= 0) { A.ph_on = 1; A.ph_id = id; A.ph_k = pk; env_drag(pk, (float)fx, (float)fy); continue; }
+                }
+                int ph = hit_test((int)fx, (int)fy, A.page, A.fx_sec, g_sl_n);
+                if (ph >= B_PAD0) { pad_press(id, ph - B_PAD0); continue; }
+            }
 
             if (in_wave && g_mode == 1 && A.page != 2 && !A.sdrag_on && !A.scrubbing && g_state != ST_RECORDING
                 && length > 1 && fy < WAVE_Y + 46) {
@@ -4648,7 +5306,7 @@ int main(void) {
                     clamp_view(length);
                     split = 0;
                 }
-            } else if (wn >= 2 && g_mode == 0 && g_state != ST_RECORDING && length > 1 && !A.knob_on && !A.curve_on) {
+            } else if (wn >= 2 && g_mode == 0 && A.page != 5 && g_state != ST_RECORDING && length > 1 && !A.knob_on && !A.curve_on) {
                 int ka = wi[0], kb = wi[1];
                 A.pz_on = 1; A.pz_id[0] = touch.report[ka].id; A.pz_id[1] = touch.report[kb].id;
                 double xa = touch.report[ka].x / 2.0, xb = touch.report[kb].x / 2.0;
@@ -4668,7 +5326,7 @@ int main(void) {
         }
 
         /* уже идущие касания */
-        int scrub_alive = 0, knob_alive = 0, curve_alive = 0, btn_alive = 0, sdrag_alive = 0, drag_alive[3] = { 0, 0, 0 };
+        int ph_alive = 0, ls_alive = 0, scrub_alive = 0, knob_alive = 0, curve_alive = 0, btn_alive = 0, sdrag_alive = 0, drag_alive[3] = { 0, 0, 0 };
         for (int k = 0; k < nrep; k++) {
             int id = touch.report[k].id;
             double fx = touch.report[k].x / 2.0;
@@ -4742,6 +5400,18 @@ int main(void) {
                 knob_set(A.knob_k, nv);
                 if (fabs(fx - A.knob_x0) + fabs(fy2 - A.knob_y0) > 8.0) A.knob_last_k = -1;   /* перетаскивание - не двойное касание */
             }
+            if (A.ph_on && id == A.ph_id) { ph_alive = 1; env_drag(A.ph_k, (float)fx, (float)(touch.report[k].y / 2.0)); }
+            if (A.ls_on && id == A.ls_id) {
+                ls_alive = 1;
+                double dy = touch.report[k].y / 2.0 - A.ls_y0;
+                if (fabs(dy) > 8.0) A.ls_moved = 1;
+                if (A.ls_moved) {
+                    int top = A.ls_top0 - (int)floor(dy / 23.0 + 0.5);
+                    int mx = g_pu.list_n - PL_ROWS; if (mx < 0) mx = 0;
+                    g_pu.list_top = top < 0 ? 0 : (top > mx ? mx : top);
+                }
+                A.ls_fx = fx; A.ls_fy = touch.report[k].y / 2.0;
+            }
             if (A.curve_on && id == A.curve_id) {
                 curve_alive = 1;
                 double fy2 = touch.report[k].y / 2.0;
@@ -4785,6 +5455,23 @@ int main(void) {
             dbg_log("scrub end %d", endpos);
         }
         if (A.sdrag_on && !sdrag_alive) A.sdrag_on = 0;
+        if (A.ph_on && !ph_alive) A.ph_on = 0;
+        if (A.ls_on && !ls_alive) {                              /* список: короткое касание без прокрутки = выбрать строку */
+            A.ls_on = 0;
+            if (!A.ls_moved && g_pu.list_open) {
+                int row = (int)((A.ls_y0 - (CRT_Y + 38)) / 23.0);
+                if (A.ls_y0 >= CRT_Y + 38 && row >= 0 && row < PL_ROWS && g_pu.list_top + row < g_pu.list_n) {
+                    g_pu.list_sel = g_pu.list_top + row;
+                    pad_assign(g_pu.list_sel);
+                }
+            }
+        }
+        for (int q = 0; q < 4; q++) {                            /* пады, которые держали пальцем: отпустили - отпускаем */
+            if (A.pt_id[q] < 0) continue;
+            int alive = 0;
+            for (int k = 0; k < nrep; k++) if (touch.report[k].id == A.pt_id[q]) alive = 1;
+            if (!alive) pad_release_slot(q);
+        }
         for (int w = 0; w < 3; w++)
             if (A.drag_on[w] && !drag_alive[w]) { A.drag_on[w] = 0; request_autosave(length, 0); }
         if (A.knob_on && !knob_alive) A.knob_on = 0;
@@ -4854,6 +5541,8 @@ int main(void) {
         else { peak_hold -= 4; if (peak_hold < 0) peak_hold = 0; }
 
         /* ---- данные для рисования ---- */
+        pad_sync();
+        if (g_pu.cfg_dirty && ++g_pu.cfg_cnt > 90) { g_pu.cfg_dirty = 0; pad_cfg_save(); }   /* настройки пэдов пишем с задержкой после последней правки */
         UiState u;
         memset(&u, 0, sizeof(u));
         u.legend = g_legend; u.rev = g_rev_req; u.bpm = g_sl_bpm; u.bpm_t = g_bpm_target; u.bpm_b = g_bpm_base; u.mode = g_mode; u.page = A.page; u.fx_sec = A.fx_sec; u.gr_on = g_gr_on; u.flt_type = g_flt_type; u.knob_down = A.knob_on ? A.knob_k : -1; u.state = state; u.scrubbing = A.scrubbing; u.loop = g_loop;

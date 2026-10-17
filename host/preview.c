@@ -113,6 +113,25 @@ int main(int argc, char **argv) {
     if (!ui_init()) { fprintf(stderr, "ui_init failed\n"); return 1; }
     g_wave_tex[0] = vita2d_create_empty_texture(WAVE_W, WAVE_H);
     UiState u;
+    if (page == 5) {                               /* PAD: несколько искусственных сэмплов */
+        static const char *nm[6] = { "kick_808", "snare_tight", "hat_closed", "vox_chop_01", "bass_pluck", "ambient_pad" };
+        for (int i = 0; i < PAD_N; i++) pad_defaults(&g_pad[i]);
+        for (int i = 0; i < 6; i++) {
+            int n = 24000 + i * 5000;
+            g_pad[i].d = malloc((size_t)n * 2); g_pad[i].n = n; g_pad[i].rate = 44100;
+            snprintf(g_pad[i].name, sizeof g_pad[i].name, "%s", nm[i]);
+            for (int j = 0; j < n; j++) g_pad[i].d[j] = (int16_t)(24000 * sin(j * (0.02 + 0.01 * i)) * exp(-(double)j / (n * 0.35)) * (i == 5 ? 0.6 + 0.4 * sin(j * 0.0004) : 1.0));
+            for (int c = 0; c < PAD_PK; c++) { int mx = 0; for (int j = n * c / PAD_PK; j < n * (c + 1) / PAD_PK; j++) { int v = abs(g_pad[i].d[j]); if (v > mx) mx = v; } g_pad[i].pk[c] = (uint8_t)(mx >> 7); }
+        }
+        g_pad[0].a = 4; g_pad[0].dc = 40; g_pad[0].s = 55; g_pad[0].r = 25; g_pad[0].start = 12; g_pad[0].mode = 1;
+        g_pu.sel = 0; g_pe_vol = 80; g_pe_pitch = 24; g_pe_start = 12;
+        g_pad_mask = 1 << 3; g_pu.down_mask = 1 << 1;
+        if (sc == 3) {
+            g_pu.list_open = 1; g_pu.list_n = 14; g_pu.list_sel = 3;
+            static const char *ln[14] = { "ambient_pad.wav", "bass_pluck.wav", "hat_closed.wav", "kick_808.wav", "rec_001.wav", "rec_002.wav", "rec_003.wav", "snare_tight.wav", "vox_chop_01.wav", "vox_chop_02.wav", "loop_90bpm.wav", "my_sample.wav", "test.wav", "zzz.wav" };
+            for (int i = 0; i < 14; i++) snprintf(g_pu.list[i], 40, "%s", ln[i]);
+        }
+    }
     scene(&u, page, mode, ST_PLAYING);
     u.fx_sec = fxsec; u.legend = legend;
     if (mode == 1) { for (int i = 0; i <= 8; i++) g_sl_pos[i] = len * i / 8; g_sl_n = 8; u.sl_n = 8; }
