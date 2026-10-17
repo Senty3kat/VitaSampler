@@ -5,3 +5,7 @@ check:
 preview: preview.c ../main.c
 	gcc $(CFLAGS) -w preview.c -o preview.bin -lm -lpng $(shell pkg-config --libs freetype2) -Wl,--unresolved-symbols=ignore-all
 	python3 shot.py
+export: export_design.c ../main.c
+	mkdir -p ../design/parts
+	gcc $(CFLAGS) -w export_design.c -o export_design.bin -lm -lpng -Wl,--unresolved-symbols=ignore-all
+	./export_design.bin ../design/parts
