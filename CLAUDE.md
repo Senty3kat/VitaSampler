@@ -79,7 +79,8 @@
   Касание → счётчики `g_pad_trig/g_pad_rel` (UI-поток пишет, аудио-поток читает; удар и отпускание за один кадр обрабатываются по порядку).
 - UI: страница 5 — свой фон (`skin_render_static_ex(c,1)`: большая панель вместо нижней, маленький ЭЛТ-осциллограф `PBZ_*/PCRT_*` справа сверху,
   стекло `g_cv_glass2`), свой холст органов `g_cv_page[5]` высотой `PAD_CH` (текстуры `g_tex_pctl`). Пады 104×104 слева (`pad5_geom`),
-  справа ручки VOLUME/PITCH/START и кнопки LOAD WAV / MODE / ADSR / CLEAR PAD. ADSR — подстраница (`g_pad_env_sub`): ручки ATTACK/DECAY/SUSTAIN/RELEASE,
-  на осциллографе волна + кривая. Ручки 12–18 (`g_pe_*` ↔ выбранный пад через `pad_sync`). Список WAV (`draw_pad_list`) — поверх нижней правой части.
+  слева экран и ручки VOLUME/PITCH/START, кнопки LOAD WAV / MODE / ADSR / COMP / CLEAR; пады — справа (под правую руку), индикатора уровня на этой странице нет.
+  Подстраницы (`g_pad_env_sub`): 1 ADSR (ручки ATTACK/DECAY/SUSTAIN/RELEASE, на осциллографе волна + кривая), 2 COMP (THRESHOLD/RATIO/MAKEUP/MIX, на осциллографе передаточная кривая;
+  компрессор в `pad_mix_add` на каждый голос, атака 5 мс, спад ~100 мс). pads.cfg — версия 2. Ручки 12–18 (`g_pe_*` ↔ выбранный пад через `pad_sync`). Список WAV (`draw_pad_list`) — поверх нижней правой части.
   D-pad выбирает пад, X играет.
 - Хост: `make -C host preview` рисует `pad` и `pad_list`.

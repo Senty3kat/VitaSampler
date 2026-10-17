@@ -82,7 +82,7 @@ unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 #define GL_W (CRT_W + 2 * GL_M)
 #define GL_H (CRT_H + 2 * GL_M)
 /* страница PAD: большие пады слева, маленький осциллограф справа сверху */
-#define PBZ_X 494
+#define PBZ_X 10
 #define PBZ_Y 46
 #define PBZ_W 394
 #define PBZ_H 158
@@ -839,21 +839,23 @@ typedef struct {
     char path[160], name[32];
     volatile int loading;
     uint8_t pk[208];                               /* обзор волны для экрана */
+    int cth, crat, cmk, cmx;                       /* компрессор: порог (100 = выкл.), степень, подъём, микс 0..100 */
     int vol, pitch, start, mode, a, dc, s, r;      /* vol 0..100, pitch 0..48 (=-24..+24 пт), start 0..99 %, mode 0/1/2, a/dc/r 0..100 (время), s 0..100 % */
 } Pad;
 #define PAD_PK 208
 static Pad g_pad[PAD_N];
 static volatile int g_pe_vol = 80, g_pe_pitch = 24, g_pe_start = 0;   /* значения ручек выбранного пада */
 static volatile int g_pe_a = 0, g_pe_dc = 30, g_pe_s = 100, g_pe_r = 10;
+static volatile int g_pe_cth = 100, g_pe_crat = 40, g_pe_cmk = 0, g_pe_cmx = 100;
 static int g_pad_env_sub = 0;                      /* подстраница PAD: 0 основная, 1 огибающая ADSR */
-typedef struct { int pad, stage, gate; double pos; float env, rel; } PVoice;   /* stage: 0 пусто, 1 A, 2 D, 3 S, 4 R */
+typedef struct { int pad, stage, gate; double pos; float env, rel, cenv, cg; } PVoice;   /* stage: 0 пусто, 1 A, 2 D, 3 S, 4 R */
 static PVoice g_pv[PAD_VOICES];
 static volatile unsigned g_pad_trig[PAD_N], g_pad_rel[PAD_N];
 static volatile int g_pad_mask;                    /* биты пэдов, у которых сейчас звучит голос (для индикации) */
 static unsigned g_pad_seen_t[PAD_N], g_pad_seen_r[PAD_N];
 
 static float pad_ms(int v) { float t = (float)v / 100.0f; return 3000.0f * t * t; }
-static void pad_defaults(Pad *p) { p->vol = 80; p->pitch = 24; p->start = 0; p->mode = 0; p->a = 0; p->dc = 30; p->s = 100; p->r = 10; }
+static void pad_defaults(Pad *p) { p->vol = 80; p->pitch = 24; p->start = 0; p->mode = 0; p->a = 0; p->dc = 30; p->s = 100; p->r = 10; p->cth = 100; p->crat = 40; p->cmk = 0; p->cmx = 100; }
 
 static void pad_voice_trigger(int i) {
     Pad *p = &g_pad[i];
@@ -864,7 +866,7 @@ static void pad_voice_trigger(int i) {
     for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].stage == 0) { fv = k; break; }
     if (fv < 0) { float me = 1e9f; for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].env < me) { me = g_pv[k].env; fv = k; } }
     PVoice *v = &g_pv[fv];
-    v->pad = i; v->stage = 1; v->gate = 1; v->env = 0.0f; v->rel = 0.0f;
+    v->pad = i; v->stage = 1; v->gate = 1; v->env = 0.0f; v->rel = 0.0f; v->cenv = 0.0f; v->cg = 1.0f;
     v->pos = (double)p->n * (double)p->start / 100.0;
 }
 static void pad_voice_release(int i) {
@@ -908,6 +910,11 @@ static void pad_mix_add(int16_t *mono, int *peak) {
         if (rs < 96.0f) rs = 96.0f;
         const float sus = (float)p->s / 100.0f;
         float gain = (float)p->vol / 100.0f; gain = gain * sqrtf(gain) * 0.9f;
+        const int comp_on = (p->cth < 100 && p->crat > 0) || p->cmk > 0;
+        const float cthr = powf(10.0f, -48.0f * (1.0f - (float)p->cth / 100.0f) / 20.0f);
+        const float cratio = 1.0f + 19.0f * ((float)p->crat / 100.0f) * ((float)p->crat / 100.0f);
+        const float cslope = 1.0f - 1.0f / cratio;
+        const float cmake = powf(10.0f, 18.0f * (float)p->cmk / 100.0f / 20.0f), cmix = (float)p->cmx / 100.0f;
         const double endp = (double)(p->n - 1);
         const double lstart = (double)p->n * (double)p->start / 100.0;
         const double rthr = endp - (double)step * (double)rs;
@@ -930,7 +937,18 @@ static void pad_mix_add(int16_t *mono, int *peak) {
                 float rem = (float)((endp - v->pos) / (double)step);
                 v->stage = 4; v->rel = v->env / (rem > 1.0f ? rem : 1.0f);
             }
-            acc[i] += smp * v->env * gain;
+            float xs = smp * v->env;
+            if (comp_on) {                                                  /* компрессор пада: следящая огибающая, усиление каждые 16 отсчётов */
+                float lv = fabsf(xs) * (1.0f / 32768.0f);
+                v->cenv += (lv > v->cenv ? 0.0042f : 0.0002f) * (lv - v->cenv);
+                if ((i & 15) == 0) {
+                    float tg = 1.0f;
+                    if (v->cenv > cthr) tg = exp2f(-log2f(v->cenv / cthr) * cslope);
+                    v->cg += (tg - v->cg) * 0.3f;
+                }
+                xs = xs * (1.0f - cmix) + xs * v->cg * cmake * cmix;
+            }
+            acc[i] += xs * gain;
             v->pos += (double)step;
         }
     }
@@ -1033,17 +1051,18 @@ static int pad_load_wav(int pi, const char *path, char *err, size_t ecap) {
 }
 
 /* ---- настройки пэдов: файл pads.cfg ---- */
-typedef struct { char path[160]; int32_t v[8]; } PadCfgRec;
+typedef struct { char path[160]; int32_t v[12]; } PadCfgRec;
 static void pad_cfg_save(void) {
     FILE *f = fopen(PAD_CFG, "wb");
     if (!f) return;
-    uint32_t hdr[2] = { 0x50414443u, 1u };
+    uint32_t hdr[2] = { 0x50414443u, 2u };
     fwrite(hdr, 4, 2, f);
     for (int i = 0; i < PAD_N; i++) {
         PadCfgRec r; memset(&r, 0, sizeof r);
         Pad *p = &g_pad[i];
         snprintf(r.path, sizeof r.path, "%s", p->d ? p->path : "");
         r.v[0] = p->vol; r.v[1] = p->pitch; r.v[2] = p->start; r.v[3] = p->mode; r.v[4] = p->a; r.v[5] = p->dc; r.v[6] = p->s; r.v[7] = p->r;
+        r.v[8] = p->cth; r.v[9] = p->crat; r.v[10] = p->cmk; r.v[11] = p->cmx;
         fwrite(&r, sizeof r, 1, f);
     }
     fclose(f);
@@ -1053,14 +1072,14 @@ static void pad_cfg_load(void) {
     FILE *f = fopen(PAD_CFG, "rb");
     if (!f) return;
     uint32_t hdr[2];
-    if (fread(hdr, 4, 2, f) == 2 && hdr[0] == 0x50414443u && hdr[1] == 1u) {
+    if (fread(hdr, 4, 2, f) == 2 && hdr[0] == 0x50414443u && hdr[1] == 2u) {
         for (int i = 0; i < PAD_N; i++) {
             PadCfgRec r;
             if (fread(&r, sizeof r, 1, f) != 1) break;
             Pad *p = &g_pad[i];
-            int *dst[8] = { &p->vol, &p->pitch, &p->start, &p->mode, &p->a, &p->dc, &p->s, &p->r };
-            static const int mx[8] = { 100, 48, 99, 2, 100, 100, 100, 100 };
-            for (int q = 0; q < 8; q++) *dst[q] = r.v[q] < 0 ? 0 : (r.v[q] > mx[q] ? mx[q] : r.v[q]);
+            int *dst[12] = { &p->vol, &p->pitch, &p->start, &p->mode, &p->a, &p->dc, &p->s, &p->r, &p->cth, &p->crat, &p->cmk, &p->cmx };
+            static const int mx[12] = { 100, 48, 99, 2, 100, 100, 100, 100, 100, 100, 100, 100 };
+            for (int q = 0; q < 12; q++) *dst[q] = r.v[q] < 0 ? 0 : (r.v[q] > mx[q] ? mx[q] : r.v[q]);
             r.path[sizeof r.path - 1] = 0;
             if (r.path[0]) { char e[48]; pad_load_wav(i, r.path, e, sizeof e); }
         }
@@ -2570,7 +2589,7 @@ enum {
     B_SL_MINUS, B_SL_PLUS, B_BPM_MINUS, B_BPM_PLUS,
     B_TAB0, B_TAB1, B_TAB2, B_TAB3, B_TAB4, B_TAB5,
     B_ADV0, B_ADV1, B_ADV2, B_ADV3,
-    B_GR_ON, B_FSEC0, B_FSEC1, B_FT0, B_FT1, B_FT2, B_FT3, B_CURVE, B_PLOAD, B_PMODE, B_PENV, B_PCLR,
+    B_GR_ON, B_FSEC0, B_FSEC1, B_FT0, B_FT1, B_FT2, B_FT3, B_CURVE, B_PLOAD, B_PMODE, B_PENV, B_PCMP, B_PCLR,
     B_KNOB0 = 60,
     B_PAD0 = 100
 };
@@ -2606,8 +2625,8 @@ static void pad_geom(int i, int n, int *x, int *y, int *w, int *h) {
 
 /* сетка пэдов PAD: 4x4 */
 static void pad5_geom(int i, int *x, int *y, int *w, int *h) {
-    *w = 104; *h = 104;
-    *x = 18 + (i % 4) * 118;
+    *w = 116; *h = 104;
+    *x = 432 + (i % 4) * 130;
     *y = 52 + (i / 4) * 118;
 }
 
@@ -2621,7 +2640,7 @@ typedef struct {
 } KnobDef;
 enum { PG_EDIT = 1, PG_SLICE = 2, PG_GRAIN = 4, PG_FX = 8, PG_ADV = 16, PG_ALL = 31, PG_PAD = 32 };
 static const int g_tab_page[6] = { 0, 1, 2, 4, 3, 5 };      /* вкладки сверху: EDIT SLICE GRAIN ADV FX PAD -> номер страницы */
-#define N_KNOBS 19
+#define N_KNOBS 23
 static KnobDef g_kd[N_KNOBS];
 
 static void knobs_init(void) {
@@ -2638,13 +2657,17 @@ static void knobs_init(void) {
         { &g_fx[0],      16,  15, "BIT DEPTH", 470, 448, 30, PG_FX,   1 },
         { &g_fx[1],     101, 100, "SAMPLE RATE", 620, 448, 30, PG_FX, 1 },
         { &g_gr_det,    101,   0, "DETUNE",  728, 436, 28, PG_GRAIN, -1 },
-        { &g_pe_vol,    101,  80, "VOLUME",  546, 290, 28, PG_PAD, 0 },
-        { &g_pe_pitch,   49,  24, "PITCH",   690, 290, 28, PG_PAD, 0 },
-        { &g_pe_start,  100,   0, "START",   834, 290, 28, PG_PAD, 0 },
-        { &g_pe_a,      101,   0, "ATTACK",  542, 290, 28, PG_PAD, 1 },
-        { &g_pe_dc,     101,  30, "DECAY",   638, 290, 28, PG_PAD, 1 },
-        { &g_pe_s,      101, 100, "SUSTAIN", 734, 290, 28, PG_PAD, 1 },
-        { &g_pe_r,      101,  10, "RELEASE", 830, 290, 28, PG_PAD, 1 },
+        { &g_pe_vol,    101,  80, "VOLUME",   62, 290, 28, PG_PAD, 0 },
+        { &g_pe_pitch,   49,  24, "PITCH",   206, 290, 28, PG_PAD, 0 },
+        { &g_pe_start,  100,   0, "START",   350, 290, 28, PG_PAD, 0 },
+        { &g_pe_a,      101,   0, "ATTACK",   58, 290, 28, PG_PAD, 1 },
+        { &g_pe_dc,     101,  30, "DECAY",   154, 290, 28, PG_PAD, 1 },
+        { &g_pe_s,      101, 100, "SUSTAIN", 250, 290, 28, PG_PAD, 1 },
+        { &g_pe_r,      101,  10, "RELEASE", 346, 290, 28, PG_PAD, 1 },
+        { &g_pe_cth,    101, 100, "THRESHOLD", 58, 290, 28, PG_PAD, 2 },
+        { &g_pe_crat,   101,  40, "RATIO",   154, 290, 28, PG_PAD, 2 },
+        { &g_pe_cmk,    101,   0, "MAKEUP",  250, 290, 28, PG_PAD, 2 },
+        { &g_pe_cmx,    101, 100, "MIX",     346, 290, 28, PG_PAD, 2 },
     };
     memcpy(g_kd, k, sizeof(k));
 }
@@ -2686,6 +2709,10 @@ static void knob_text(int k, char *out, size_t cap) {
     case 14: snprintf(out, cap, "%d %%", v); break;
     case 15: case 16: case 18: snprintf(out, cap, "%d ms", (int)(pad_ms(v) + 0.5f)); break;
     case 17: snprintf(out, cap, "%d %%", v); break;
+    case 19: if (v >= 100) snprintf(out, cap, "off"); else snprintf(out, cap, "%d dB", (int)(-48.0f * (1.0f - (float)v / 100.0f) - 0.5f)); break;
+    case 20: { float r = 1.0f + 19.0f * (float)v / 100.0f * (float)v / 100.0f; int r10 = (int)(r * 10.0f + 0.5f); snprintf(out, cap, "%d.%d : 1", r10 / 10, r10 % 10); break; }
+    case 21: snprintf(out, cap, "+%d dB", (int)(18.0f * (float)v / 100.0f + 0.5f)); break;
+    case 22: snprintf(out, cap, "%d %%", v); break;
     default: { float d = (float)v / 100.0f; snprintf(out, cap, "%d ct", (int)(1200.0f * d * d + 0.5f)); break; }
     }
 }
@@ -2702,10 +2729,11 @@ static int btn_geom(int id, int *x, int *y, int *w, int *h) {
     case B_BPM_PLUS:  *x = 894; *y = 472; *w = 38; *h = 38; return 1;
     case B_GR_ON:     *x = 840; *y = 392; *w = 90; *h = 90; return 1;
     case B_CURVE:     *x = CURVE_X; *y = CURVE_Y; *w = CURVE_W; *h = CURVE_H; return 1;
-    case B_PLOAD:     *x = 494; *y = 384; *w = 190; *h = 64; return 1;
-    case B_PMODE:     *x = 698; *y = 384; *w = 190; *h = 64; return 1;
-    case B_PENV:      *x = 494; *y = 462; *w = 190; *h = 64; return 1;
-    case B_PCLR:      *x = 698; *y = 462; *w = 190; *h = 64; return 1;
+    case B_PLOAD:     *x = 10;  *y = 384; *w = 192; *h = 64; return 1;
+    case B_PMODE:     *x = 210; *y = 384; *w = 192; *h = 64; return 1;
+    case B_PENV:      *x = 10;  *y = 462; *w = 122; *h = 64; return 1;
+    case B_PCMP:      *x = 142; *y = 462; *w = 122; *h = 64; return 1;
+    case B_PCLR:      *x = 274; *y = 462; *w = 128; *h = 64; return 1;
     }
     if (id >= B_FSEC0 && id <= B_FSEC1) { *x = 316 + (id - B_FSEC0) * 110; *y = 372; *w = 100; *h = 28; return 1; }
     if (id >= B_FT0 && id <= B_FT3) { int i = id - B_FT0; *x = 690 + (i % 2) * 62; *y = 410 + (i / 2) * 60; *w = 54; *h = 54; return 1; }
@@ -2716,7 +2744,7 @@ static int btn_geom(int id, int *x, int *y, int *w, int *h) {
 static int hit_test(int tx, int ty, int page, int sec, int sl_n) {
     int ids[26], n = 0;
     ids[n++] = B_TAB0; ids[n++] = B_TAB1; ids[n++] = B_TAB2; ids[n++] = B_TAB3; ids[n++] = B_TAB4; ids[n++] = B_TAB5;
-    if (page == 5) { ids[n++] = B_PLOAD; ids[n++] = B_PMODE; ids[n++] = B_PENV; ids[n++] = B_PCLR; }
+    if (page == 5) { ids[n++] = B_PLOAD; ids[n++] = B_PMODE; ids[n++] = B_PENV; ids[n++] = B_PCMP; ids[n++] = B_PCLR; }
     if (page == 0) { ids[n++] = B_CROP; ids[n++] = B_UNDO; ids[n++] = B_REV; ids[n++] = B_NORM; }
     if (page == 1) { ids[n++] = B_SL_MINUS; ids[n++] = B_SL_PLUS; ids[n++] = B_BPM_MINUS; ids[n++] = B_BPM_PLUS; }
     if (page == 2) ids[n++] = B_GR_ON;
@@ -2842,6 +2870,8 @@ static void skin_render_static_ex(Canvas *c, int pad) {
                 int sy = 353 - (y - 354) % 38, sxx = (x >= 894 && x <= 954) ? x - 70 : x;     /* зеркально от края: без шва */
                 c->px[y * c->w + x] = c->px[sy * c->w + sxx];
             }
+        for (int y = 42; y < 354; y++)                                          /* панель индикатора уровня на PAD не нужна */
+            for (int x = 884; x < c->w; x++) c->px[y * c->w + x] = c->px[y * c->w + x - 80];
     }
 
     /* верхняя планка */
@@ -2877,12 +2907,13 @@ static void skin_render_static_ex(Canvas *c, int pad) {
         } else {
             for (int i = 1; i < 4; i++) {
                 int yy = 102 + i * 82 / 4;
-                for (int x = 518; x < 518 + 346; x += 8) cv_rect(c, x, yy, 4, 1, RGBA8(255, 150, 46, 34));
+                for (int x = PBZ_X + 24; x < PBZ_X + 24 + 346; x += 8) cv_rect(c, x, yy, 4, 1, RGBA8(255, 150, 46, 34));
             }
-            for (int i = 1; i < 12; i++) cv_rect(c, 518 + i * 346 / 12, 102, 1, 82, RGBA8(255, 150, 46, 20));
+            for (int i = 1; i < 12; i++) cv_rect(c, PBZ_X + 24 + i * 346 / 12, 102, 1, 82, RGBA8(255, 150, 46, 20));
         }
     }
 
+    if (!pad) {
     /* индикатор уровня: врезанная панель, стеклянная трубка, засечки, окна пика и перегруза */
     if (!have_body) {
         cv_rrect_grad(c, 896, 46, 56, 306, 5, RGBA8(200, 194, 176, 255), RGBA8(186, 179, 160, 255));
@@ -2903,6 +2934,7 @@ static void skin_render_static_ex(Canvas *c, int pad) {
             int v = (int)(58.0f * sh);
             c->px[(METER_Y + y) * c->w + METER_X + x] = RGBA8(v, v - 5 > 0 ? v - 5 : 0, v - 10 > 0 ? v - 10 : 0, 255);
         }
+    }
     }
 
     /* панель управления (при наличии body.png она уже нарисована в фоне) */
@@ -3006,7 +3038,7 @@ static void top_render(Canvas *c, const UiState *u) {
 #define W_GRON    62
 #define W_FT0     63           /* 63..66 типы фильтра */
 #define W_CURVE   67
-#define W_COUNT   68
+#define W_COUNT   68      /* W_SIDE0 + 4 (пятая кнопка PAD) = 60, на странице PAD W_SEG0 не используется */
 static int g_wcode[W_COUNT];
 static int g_page_key = -1;
 
@@ -3094,7 +3126,7 @@ static void draw_curve(Canvas *c, int cy0) {
 /* ====================================================================
  *  PAD: интерфейс (большие пады 4x4 слева, маленький осциллограф и ручки справа, список WAV, подстраница ADSR)
  * ==================================================================== */
-#define ENV_X 518                    /* окно осциллографа */
+#define ENV_X (PBZ_X + 24)                    /* окно осциллографа */
 #define ENV_Y 102
 #define ENV_W 346
 #define ENV_H 82
@@ -3103,7 +3135,7 @@ static void draw_curve(Canvas *c, int cy0) {
 #define ENV_L 4.0f
 #define ENV_TOP 6.0f
 #define ENV_BASE (ENV_H - 6.0f)
-#define LST_X 494                    /* список WAV занимает нижнюю правую часть, пады остаются доступны */
+#define LST_X 10                    /* список WAV занимает нижнюю правую часть, пады остаются доступны */
 #define LST_Y 212
 #define LST_W 394
 #define LST_H 322
@@ -3125,19 +3157,20 @@ static void pad_mark_dirty(void) { g_pu.cfg_dirty = 1; g_pu.cfg_cnt = 0; }
 
 /* значения ручек <-> выбранный пад (по теневой копии: двойной тап по ручке тоже записывается) */
 static void pad_sync(void) {
-    static int sh[7], sh_sel = -1;
+    enum { NV = 11 };
+    static int sh[NV], sh_sel = -1;
     Pad *p = &g_pad[g_pu.sel];
-    int *pv[7] = { &p->vol, &p->pitch, &p->start, &p->a, &p->dc, &p->s, &p->r };
-    volatile int *ev[7] = { &g_pe_vol, &g_pe_pitch, &g_pe_start, &g_pe_a, &g_pe_dc, &g_pe_s, &g_pe_r };
+    int *pv[NV] = { &p->vol, &p->pitch, &p->start, &p->a, &p->dc, &p->s, &p->r, &p->cth, &p->crat, &p->cmk, &p->cmx };
+    volatile int *ev[NV] = { &g_pe_vol, &g_pe_pitch, &g_pe_start, &g_pe_a, &g_pe_dc, &g_pe_s, &g_pe_r, &g_pe_cth, &g_pe_crat, &g_pe_cmk, &g_pe_cmx };
     if (g_pu.sel != sh_sel) {
-        for (int i = 0; i < 7; i++) { *ev[i] = *pv[i]; sh[i] = *pv[i]; }
+        for (int i = 0; i < NV; i++) { *ev[i] = *pv[i]; sh[i] = *pv[i]; }
         sh_sel = g_pu.sel;
         return;
     }
     int changed = 0;
-    for (int i = 0; i < 7; i++) if (*ev[i] != sh[i]) changed = 1;
+    for (int i = 0; i < NV; i++) if (*ev[i] != sh[i]) changed = 1;
     if (changed) {
-        for (int i = 0; i < 7; i++) { *pv[i] = *ev[i]; sh[i] = *ev[i]; }
+        for (int i = 0; i < NV; i++) { *pv[i] = *ev[i]; sh[i] = *ev[i]; }
         pad_mark_dirty();
     }
 }
@@ -3197,7 +3230,28 @@ static void env_render(Canvas *c, const Pad *p, int with_env) {
         cv_rect(c, sx, 0, 1, c->h, RGBA8(120, 230, 140, 190));
         cv_rect(c, sx, 0, 6, 2, RGBA8(120, 230, 140, 190));
     }
-    if (with_env) {
+    if (with_env == 2) {                                   /* передаточная кривая компрессора: вход -48..0 дБ, выход -48..+18 дБ */
+        float thr = -48.0f * (1.0f - (float)p->cth / 100.0f), mk = 18.0f * (float)p->cmk / 100.0f;
+        float ratio = 1.0f + 19.0f * (float)p->crat / 100.0f * (float)p->crat / 100.0f, mix = (float)p->cmx / 100.0f;
+        int pyy = -1;
+        for (int x = 0; x < c->w; x++) {
+            float in = -48.0f + 48.0f * (float)x / (float)(c->w - 1);
+            float wet = (in < thr ? in : thr + (in - thr) / ratio) + mk;
+            float out = in + (wet - in) * mix;
+            float yy = ENV_BASE - (out + 48.0f) / 66.0f * (ENV_BASE - ENV_TOP);
+            if (yy < ENV_TOP) yy = ENV_TOP;
+            if (yy > ENV_BASE) yy = ENV_BASE;
+            int iy = (int)yy;
+            cv_rect(c, x, iy, 1, pyy >= 0 && pyy != iy ? (pyy > iy ? pyy - iy + 1 : 1) : 2, RGBA8(255, 232, 160, 255));
+            if (pyy >= 0 && pyy < iy) cv_rect(c, x, pyy, 1, iy - pyy + 1, RGBA8(255, 232, 160, 255));
+            pyy = iy;
+        }
+        float y0 = ENV_BASE - (0.0f + 48.0f) / 66.0f * (ENV_BASE - ENV_TOP);
+        for (int x = 0; x < c->w; x += 6) cv_rect(c, x, (int)y0, 3, 1, RGBA8(255, 150, 46, 110));      /* уровень 0 дБ на выходе */
+        float xt = (thr + 48.0f) / 48.0f * (float)(c->w - 1);
+        cv_rect(c, (int)xt, 0, 1, c->h, RGBA8(120, 230, 140, 160));                                        /* порог */
+    }
+    if (with_env == 1) {
         float px[5], py[5];
         env_points(p, px, py);
         for (int x = (int)px[0]; x <= (int)px[4] && x < c->w; x++) {
@@ -3228,7 +3282,7 @@ static void cv_padcell(Canvas *c, int x, int y, int w, int h, int sel, int pr, i
             int a0 = i * PAD_PK / nb, mx = 0;
             for (int q = a0; q < a0 + PAD_PK / nb + 1 && q < PAD_PK; q++) if (p->pk[q] > mx) mx = p->pk[q];
             int hh = (int)((float)mx / 255.0f * 17.0f);
-            cv_rect(c, x + 14 + i * 2, y + off + 58 - hh, 2, 2 * hh + 1, sel ? RGBA8(120, 46, 8, 210) : RGBA8(104, 92, 72, 200));
+            cv_rect(c, x + (w - 76) / 2 + i * 2, y + off + 58 - hh, 2, 2 * hh + 1, sel ? RGBA8(120, 46, 8, 210) : RGBA8(104, 92, 72, 200));
         }
     }
 }
@@ -3357,10 +3411,10 @@ static int ctl_update(Canvas *c, const UiState *u) {
                 changed = 1;
             }
         }
-        static const int pids[4] = { B_PLOAD, B_PMODE, B_PENV, B_PCLR };
-        for (int k = 0; k < 4; k++) {
+        static const int pids[5] = { B_PLOAD, B_PMODE, B_PENV, B_PCMP, B_PCLR };
+        for (int k = 0; k < 5; k++) {
             int id = pids[k];
-            int on = (k == 0 && g_pu.list_open) || (k == 2 && g_pad_env_sub);
+            int on = (k == 0 && g_pu.list_open) || (k == 2 && g_pad_env_sub == 1) || (k == 3 && g_pad_env_sub == 2);
             int code = 1 + 4 * (u->btn_down == id) + 2 * on + (k == 1 ? 8 * g_pad[g_pu.sel].mode : 0);
             if (code != g_wcode[W_SIDE0 + k]) {
                 int x, y, w, h;
@@ -3721,6 +3775,7 @@ static void draw_pad_crt(const UiState *u) {
         int tenth = (int)((int64_t)p->n * 10 / (p->rate > 0 ? p->rate : 1));
         snprintf(buf, sizeof(buf), "%d.%d s   %d Hz   %s", tenth / 10, tenth % 10, p->rate, g_pmode_name[p->mode]);
     } else snprintf(buf, sizeof(buf), "%s", g_pmode_name[p->mode]);
+    if (g_pad_env_sub == 2) { char b2[40]; snprintf(b2, sizeof(b2), "   COMP  in -48..0 dB"); strncat(buf, b2, sizeof(buf) - strlen(buf) - 1); }
     text(ENV_X + 96, 94, K_AMBER_DIM, 0.55f, buf);
     if (g_env_cur >= 0 && g_tex_env[g_env_cur]) vita2d_draw_texture(g_tex_env[g_env_cur], ENV_X, ENV_Y);
     if (p->d && p->n > 1)
@@ -3871,8 +3926,8 @@ static void ui_draw(const UiState *u) {
     if (u->page == 5) { if (g_tex_glass2) vita2d_draw_texture(g_tex_glass2, PCRT_X - GL_M, PCRT_Y - GL_M); }
     else if (g_tex_glass) vita2d_draw_texture(g_tex_glass, CRT_X - GL_M, CRT_Y - GL_M);
 
-    /* индикатор уровня: сплошной градиент в стеклянной трубке, пик, засечки, окна */
-    {
+    /* индикатор уровня: сплошной градиент в стеклянной трубке, пик, засечки, окна (на странице PAD его нет) */
+    if (u->page != 5) {
         int lit = u->level_pct * METER_H / 1000;
         if (lit > METER_H) lit = METER_H;
         if (lit > 0 && g_tex_meter)
@@ -3961,24 +4016,24 @@ static void ui_draw(const UiState *u) {
                 text_c(x + w / 2, y + h - 16 + off, sl ? K_CREAM_HI : K_BROWN, 0.55f, nm);
             } else text_c(x + w / 2, y + h - 16 + off, sl ? K_CREAM_HI : K_BROWN_LO, 0.55f, "empty");
         }
-        static const char *bl[4] = { "LOAD WAV", NULL, "ADSR", "CLEAR PAD" };
-        static const char *bs[4] = { "pick a file for this pad", NULL, "attack decay sustain release", "remove the sample" };
-        static const int bid[4] = { B_PLOAD, B_PMODE, B_PENV, B_PCLR };
-        for (int k = 0; k < 4; k++) {
+        static const char *bl[5] = { "LOAD WAV", NULL, "ADSR", "COMP", "CLEAR" };
+        static const char *bs[5] = { "pick a file for this pad", NULL, "volume envelope", "compressor", "remove sample" };
+        static const int bid[5] = { B_PLOAD, B_PMODE, B_PENV, B_PCMP, B_PCLR };
+        for (int k = 0; k < 5; k++) {
             int x, y, w, h;
             btn_geom(bid[k], &x, &y, &w, &h);
-            int on = (k == 0 && g_pu.list_open) || (k == 2 && g_pad_env_sub);
+            int on = (k == 0 && g_pu.list_open) || (k == 2 && g_pad_env_sub == 1) || (k == 3 && g_pad_env_sub == 2);
             int off = ((u->btn_down == bid[k]) || on) ? 2 : 0;
             if (k == 1) {
                 text_c(x + w / 2, y + 28 + off, K_BROWN_LO, 0.55f, "MODE");
                 text_c(x + w / 2, y + 47 + off, K_BROWN, 0.82f, g_pmode_name[g_pad[g_pu.sel].mode]);
             } else {
-                const char *t = (k == 2 && g_pad_env_sub) ? "BACK" : bl[k];
-                text_c(x + w / 2, y + 30 + off, K_BROWN, 0.82f, t);
-                text_c(x + w / 2, y + 48 + off, K_BROWN_LO, 0.5f, (k == 2 && g_pad_env_sub) ? "to volume / pitch / start" : bs[k]);
+                int back = (k == 2 && g_pad_env_sub == 1) || (k == 3 && g_pad_env_sub == 2);
+                text_c(x + w / 2, y + 30 + off, K_BROWN, k >= 2 ? 0.76f : 0.82f, back ? "BACK" : bl[k]);
+                text_c(x + w / 2, y + 48 + off, K_BROWN_LO, 0.46f, back ? "volume / pitch / start" : bs[k]);
             }
         }
-        text(494, 539 - 3, K_BROWN_LO, 0.5f, "pads: touch or X     D-pad: select     SELECT+arrows: tabs");
+        text(10, 536, K_BROWN_LO, 0.5f, "pads: touch or X     D-pad: select     SELECT+arrows: tabs");
         if (g_pu.list_open) draw_pad_list();
     } else if (u->page == 2) {
         text_c(885, 461 + (((u->btn_down == B_GR_ON) || u->gr_on) ? 2 : 0), K_BROWN, 0.68f, u->gr_on ? "GRAIN ON" : "GRAIN OFF");
@@ -4780,7 +4835,13 @@ static void perform_hit(int hit) {
         g_flt_type = hit - B_FT0;
         snprintf(msg, sizeof(msg), "%s", nm[g_flt_type]);
     }
-    else if (hit == B_PENV) { g_pad_env_sub = !g_pad_env_sub; A.knob_on = 0; snprintf(msg, sizeof(msg), g_pad_env_sub ? "ADSR: shape the volume of this pad" : "Volume / pitch / start"); }
+    else if (hit == B_PENV || hit == B_PCMP) {
+        int want = hit == B_PENV ? 1 : 2;
+        g_pad_env_sub = (g_pad_env_sub == want) ? 0 : want;
+        A.knob_on = 0;
+        static const char *mt[3] = { "Volume / pitch / start", "ADSR: shape the volume of this pad", "COMP: threshold, ratio, makeup, mix (the screen shows the curve)" };
+        snprintf(msg, sizeof(msg), "%s", mt[g_pad_env_sub]);
+    }
     else if (hit == B_PCLR) { pad_clear(g_pu.sel); pad_mark_dirty(); snprintf(msg, sizeof(msg), "Pad %d cleared", g_pu.sel + 1); }
     else if (hit == B_PLOAD) { if (g_pu.list_open) g_pu.list_open = 0; else pad_list_open(); }
     else if (hit == B_PMODE) {
