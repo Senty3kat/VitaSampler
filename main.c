@@ -943,7 +943,7 @@ static void pad_mix_add(int16_t *mono, int *peak) {
                 v->cenv += (lv > v->cenv ? 0.0042f : 0.0002f) * (lv - v->cenv);
                 if ((i & 15) == 0) {
                     float tg = 1.0f;
-                    if (v->cenv > cthr) tg = exp2f(-log2f(v->cenv / cthr) * cslope);
+                    if (v->cenv > cthr) tg = expf(-logf(v->cenv / cthr) * cslope);       /* (log2f / exp2f в newlib vitasdk нет - это тот же расчёт через logf / expf) */
                     v->cg += (tg - v->cg) * 0.3f;
                 }
                 xs = xs * (1.0f - cmix) + xs * v->cg * cmake * cmix;
