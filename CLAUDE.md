@@ -9,7 +9,7 @@
 - Перед каждой итерацией смотреть свежие коммиты соседних репозиториев автора: `VitaStrummer`, `VitaTTS`, `VitaMIDI`
   (параллельные проекты; Strummer берёт отсюда приёмы UI и аудио).
 - Сборка VPK — GitHub Actions (`.github/workflows`, контейнер `vitasdk/vitasdk:2026.08`). Логи Actions из сессии
-  недоступны (403): причину ошибки видно только по ответу автора. Типичная причина — линковка (freetype требует `bz2`).
+  недоступны (403): причину ошибки видно только по ответу автора. Типичная причина — линковка (freetype требует `bz2`; `sceIoDclose` — в `SceIofilemgr_stub`). Проверка с настоящими заголовками: `git clone vitasdk/vita-headers` и `gcc -fsyntax-only -I<vita-headers>/include -Ihost/stub main.c`; символы — `db/360/*.yml`.
   Файлы шрифтов в `vita_create_vpk` — с абсолютным путём `${CMAKE_SOURCE_DIR}/fonts/...`.
 - Проверка без vitasdk (папка `host/`): `make -C host check` — строгая проверка синтаксиса `main.c` с заглушками SDK
   (`host/stub`, сигнатуры как в vitasdk; неявные объявления и int-conversion — ошибки). `make -C host preview` собирает
