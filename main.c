@@ -1072,10 +1072,147 @@ static void pad_cfg_save(void) {
     }
     fclose(f);
 }
+/* ---- заводской набор: звуки синтезируются в коде и при первом запуске записываются в ux0:data/Sampler/kit_*.wav ---- */
+#define KIT_N 16
+#define KIT_RATE 22050
+static const char *const g_kit_name[KIT_N] = {
+    "kit_kick", "kit_snare", "kit_hat_closed", "kit_hat_open", "kit_clap", "kit_tom_low", "kit_tom_high", "kit_rim",
+    "kit_bass", "kit_sub", "kit_pad_c", "kit_pad_am", "kit_pluck", "kit_bell", "kit_riser", "kit_shaker" };
+static uint32_t g_kit_rng;
+static float kit_nz(void) { g_kit_rng = g_kit_rng * 1664525u + 1013904223u; return (float)(int32_t)g_kit_rng / 2147483648.0f; }
+static float kit_sat(float x) { return x / (1.0f + fabsf(x)); }
+/* генерирует звук k в o (не больше cap отсчётов), возвращает длину; пик нормируется до 0.9 */
+static int kit_gen(int k, float *o, int cap) {
+    const float sr = (float)KIT_RATE, tp = 6.2831853f;
+    float ph = 0.0f, lp = 0.0f, lp2 = 0.0f, pp[8] = { 0 };
+    int n = 0;
+    g_kit_rng = 12345u + (uint32_t)k * 7919u;
+    static const float pad_c[2][4] = { { 130.81f, 164.81f, 196.0f, 261.63f }, { 110.0f, 130.81f, 164.81f, 220.0f } };
+    switch (k) {
+    case 0: n = (int)(0.55f * sr); break;
+    case 1: n = (int)(0.30f * sr); break;
+    case 2: n = (int)(0.09f * sr); break;
+    case 3: n = (int)(0.50f * sr); break;
+    case 4: n = (int)(0.35f * sr); break;
+    case 5: case 6: n = (int)(0.50f * sr); break;
+    case 7: n = (int)(0.08f * sr); break;
+    case 8: n = (int)(0.70f * sr); break;
+    case 9: n = (int)(1.00f * sr); break;
+    case 10: case 11: n = (int)(3.00f * sr); break;
+    case 12: n = (int)(0.60f * sr); break;
+    case 13: n = (int)(1.50f * sr); break;
+    case 14: n = (int)(1.60f * sr); break;
+    default: n = (int)(0.25f * sr); break;
+    }
+    if (n > cap) n = cap;
+    const float dur = (float)n / sr;
+    for (int i = 0; i < n; i++) {
+        const float t = (float)i / sr;
+        float x = 0.0f, w = kit_nz();
+        switch (k) {
+        case 0: {                                                  /* бочка: синус с падающей частотой + щелчок */
+            ph += tp * (45.0f + 120.0f * expf(-t * 28.0f)) / sr;
+            x = sinf(ph) * expf(-t * 7.0f) + (i < 40 ? w * 0.4f * (1.0f - (float)i / 40.0f) : 0.0f);
+            break; }
+        case 1: {                                                  /* малый: тон + шум */
+            lp += 0.25f * (w - lp);
+            x = sinf(tp * 185.0f * t) * expf(-t * 22.0f) * 0.55f + (w - lp) * expf(-t * 14.0f) * 0.9f;
+            break; }
+        case 2: lp += 0.6f * (w - lp); x = (w - lp) * expf(-t * 55.0f); break;
+        case 3: lp += 0.6f * (w - lp); x = (w - lp) * expf(-t * 9.0f); break;
+        case 4: {                                                  /* хлопок: три коротких шумовых удара и хвост */
+            lp += 0.35f * (w - lp); lp2 += 0.05f * (lp - lp2);
+            float bp = lp - lp2, e = expf(-t * 16.0f) * 0.5f;
+            for (int b = 0; b < 3; b++) { float tb = t - 0.012f * (float)b; if (tb > 0.0f) e += expf(-tb * 130.0f); }
+            x = bp * e * 1.6f;
+            break; }
+        case 5: ph += tp * (65.0f + 45.0f * expf(-t * 12.0f)) / sr; x = sinf(ph) * expf(-t * 5.5f); break;
+        case 6: ph += tp * (120.0f + 70.0f * expf(-t * 14.0f)) / sr; x = sinf(ph) * expf(-t * 7.0f); break;
+        case 7: x = (sinf(tp * 1700.0f * t) * 0.6f + sinf(tp * 480.0f * t)) * expf(-t * 70.0f); break;
+        case 8: {                                                  /* бас: пила из 4 гармоник */
+            ph += tp * 55.0f / sr;
+            for (int h = 1; h <= 4; h++) x += sinf(ph * (float)h) / (float)h;
+            x *= expf(-t * 4.0f) * (t < 0.005f ? t / 0.005f : 1.0f);
+            break; }
+        case 9: ph += tp * 41.0f / sr; x = (sinf(ph) + 0.25f * sinf(ph * 2.0f)) * expf(-t * 2.5f) * (t < 0.01f ? t / 0.01f : 1.0f); break;
+        case 10: case 11: {                                        /* аккорд из расстроенных пил, мягкий фильтр, медленная атака */
+            float a = 0.0f;
+            for (int v = 0; v < 4; v++)
+                for (int d = 0; d < 2; d++) {
+                    pp[v * 2 + d] += (pad_c[k - 10][v] * (d ? 1.004f : 0.996f)) / sr;
+                    if (pp[v * 2 + d] >= 1.0f) pp[v * 2 + d] -= 1.0f;
+                    a += pp[v * 2 + d] * 2.0f - 1.0f;
+                }
+            lp += 0.10f * (a * 0.12f - lp);
+            float e = (t < 0.4f ? t / 0.4f : 1.0f) * (dur - t < 0.8f ? (dur - t) / 0.8f : 1.0f);
+            x = lp * e * 2.0f;
+            break; }
+        case 12: {                                                 /* щипок: мягко ограниченная прямоугольная волна */
+            ph += tp * 440.0f / sr;
+            lp += 0.35f * (kit_sat(sinf(ph) * 4.0f) - lp);
+            x = lp * expf(-t * 7.0f);
+            break; }
+        case 13: x = sinf(tp * 660.0f * t + 3.0f * expf(-t * 5.0f) * sinf(tp * 924.0f * t)) * expf(-t * 3.5f); break;
+        case 14: {                                                 /* нарастание: шум с растущим срезом */
+            float r = t / dur;
+            lp += (0.02f + 0.7f * r * r) * (w - lp);
+            x = lp * r * (dur - t < 0.03f ? (dur - t) / 0.03f : 1.0f) * 2.0f;
+            break; }
+        default: {                                                 /* шейкер */
+            lp += 0.5f * (w - lp);
+            x = (w - lp) * (t < 0.03f ? t / 0.03f : expf(-(t - 0.03f) * 18.0f));
+            break; }
+        }
+        o[i] = x;
+    }
+    float pk = 1e-6f;
+    for (int i = 0; i < n; i++) if (fabsf(o[i]) > pk) pk = fabsf(o[i]);
+    for (int i = 0; i < n; i++) o[i] *= 0.9f / pk;
+    if (n > 64) for (int i = 0; i < 64; i++) o[n - 1 - i] *= (float)i / 64.0f;     /* короткий спад в ноль: без щелчка в конце */
+    return n;
+}
+static int kit_write_wav(const char *path, const int16_t *d, int n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    unsigned char h[44] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 16, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0 };
+    uint32_t db = (uint32_t)n * 2u, rt = KIT_RATE, br = KIT_RATE * 2u, rs = 36u + db;
+    memcpy(h + 4, &rs, 4); memcpy(h + 24, &rt, 4); memcpy(h + 28, &br, 4); memcpy(h + 40, &db, 4);
+    fwrite(h, 1, 44, f);
+    fwrite(d, 2, (size_t)n, f);
+    fclose(f);
+    return 1;
+}
+/* записывает недостающие kit_*.wav */
+static void kit_install(void) {
+    static float buf[KIT_RATE * 3 + 16];
+    static int16_t pcm[KIT_RATE * 3 + 16];
+    for (int k = 0; k < KIT_N; k++) {
+        char path[96];
+        snprintf(path, sizeof path, "%s/%s.wav", "ux0:data/Sampler", g_kit_name[k]);
+        FILE *t = fopen(path, "rb");
+        if (t) { fclose(t); continue; }
+        int n = kit_gen(k, buf, KIT_RATE * 3);
+        for (int i = 0; i < n; i++) { int v = (int)(buf[i] * 32767.0f); pcm[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v)); }
+        kit_write_wav(path, pcm, n);
+    }
+}
+/* первый запуск (нет pads.cfg): набор раскладывается по пэдам */
+static void kit_assign(void) {
+    for (int k = 0; k < KIT_N; k++) {
+        char path[96], e[48];
+        snprintf(path, sizeof path, "ux0:data/Sampler/%s.wav", g_kit_name[k]);
+        if (!pad_load_wav(k, path, e, sizeof e)) continue;
+        Pad *p = &g_pad[k];
+        if (k == 10 || k == 11) { p->mode = 1; p->a = 22; p->r = 35; }          /* аккорды: играют, пока держишь */
+        if (k == 14) { p->mode = 1; p->r = 20; }
+        if (k == 9) p->vol = 90;
+    }
+}
+
 static void pad_cfg_load(void) {
     for (int i = 0; i < PAD_N; i++) pad_defaults(&g_pad[i]);
     FILE *f = fopen(PAD_CFG, "rb");
-    if (!f) return;
+    if (!f) { kit_assign(); return; }
     uint32_t hdr[2];
     if (fread(hdr, 4, 2, f) == 2 && hdr[0] == 0x50414443u && hdr[1] == 2u) {
         for (int i = 0; i < PAD_N; i++) {
@@ -4905,6 +5042,7 @@ int main(void) {
     A.scrub_id = -1; A.btn_down = -1; A.btn_id = -1; A.knob_last_k = -1; A.knob_id = -1; A.curve_id = -1;
     for (int i = 0; i < 6; i++) A.prev_ids[i] = -1;
     for (int i = 0; i < 4; i++) A.pt_id[i] = -1;
+    kit_install();                              /* заводские звуки (если ещё не записаны) */
     pad_cfg_load();
 
     /* восстановить прошлую сессию, если она есть */

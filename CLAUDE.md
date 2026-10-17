@@ -83,4 +83,7 @@
   Подстраницы (`g_pad_env_sub`): 1 ADSR (ручки ATTACK/DECAY/SUSTAIN/RELEASE, на осциллографе волна + кривая), 2 COMP (THRESHOLD/RATIO/MAKEUP/MIX, на осциллографе передаточная кривая;
   компрессор в `pad_mix_add` на каждый голос, атака 5 мс, спад ~100 мс). pads.cfg — версия 2. Ручки 12–18 (`g_pe_*` ↔ выбранный пад через `pad_sync`). Список WAV (`draw_pad_list`) — поверх нижней правой части.
   D-pad выбирает пад, X играет.
-- Хост: `make -C host preview` рисует `pad` и `pad_list`.
+- Заводской набор: `kit_gen` синтезирует 16 звуков (кик, снейр, хэты, клап, томы, римшот, басы, два аккорда-пэда, щипок, колокол, нарастание, шейкер),
+  `kit_install` при запуске дописывает недостающие `ux0:data/Sampler/kit_*.wav`, `kit_assign` раскладывает их по пэдам, если нет `pads.cfg`.
+- Сборка: `vita-elf-create: Cannot allocate ... segment 1 overlaps` — код кончается у границы страницы; лечится изменением размера `text_pad` (`.space N`) в `main.c`.
+- Хост: `make -C host preview` рисует `pad`, `pad_list`, `pad_adsr`, `pad_comp`.
