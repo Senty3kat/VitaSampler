@@ -1,5 +1,5 @@
 /*
- * Vita Sampler v1.6
+ * Vita Sampler v1.7
  *
  * Кнопки: R запись/стоп, L пауза/play (удержание L = глитч, задняя панель: палец вверх/вниз = 1-30 Гц),
  *   Треугольник стоп, Квадрат петля, Круг страница FX, START сохранить WAV, SELECT справка,
@@ -862,6 +862,7 @@ static PVoice g_pv[PAD_VOICES];
 static volatile unsigned g_pad_trig[PAD_N], g_pad_rel[PAD_N];
 static volatile int g_pad_mask;                    /* биты пэдов, у которых сейчас звучит голос (для индикации) */
 static unsigned g_pad_seen_t[PAD_N], g_pad_seen_r[PAD_N];
+static volatile int g_pad_drop = 0, g_pad_steal = 0, g_pad_lock = 0, g_pad_hits = 0;   /* диагностика: потерянные / украденные / подавленные удары, всего ударов */
 static unsigned g_pv_age = 0;                       /* счётчик ударов: по нему находим самый старый голос */
 #define PAD_LAYERS 4                                /* ONE-SHOT: столько ударов одного пада звучат одновременно */
 
@@ -879,7 +880,7 @@ static void pv_fade(PVoice *v) {                    /* быстро (5 мс) п�
 }
 static void pad_voice_trigger(int i) {
     Pad *p = &g_pad[i];
-    if (!p->d || p->loading || p->n < 2) return;
+    if (!p->d || p->loading || p->n < 2) { g_pad_drop++; return; }
     int cnt = 0, oldest = -1; unsigned oa = 0xffffffffu;
     for (int k = 0; k < PAD_VOICES; k++) {
         PVoice *o = &g_pv[k];
@@ -893,6 +894,7 @@ static void pad_voice_trigger(int i) {
     for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].stage == 0) { fv = k; break; }
     if (fv < 0) {                                          /* свободных нет: берём самый тихий (уходящие в приоритете) */
         float me = 1e9f;
+        g_pad_steal++;
         for (int k = 0; k < PAD_VOICES; k++) { float e = g_pv[k].env + (g_pv[k].stage == 4 ? 0.0f : 1.0f); if (e < me) { me = e; fv = k; } }
     }
     PVoice *v = &g_pv[fv];
@@ -1065,6 +1067,10 @@ static int pad_load_wav(int pi, const char *path, char *err, size_t ecap) {
     }
     free(blk); fclose(f);
     if (frames < 16) { free(out); snprintf(err, ecap, "The file is too short"); return 0; }
+    for (int i = 0; i < 24 && i < frames / 2; i++) {          /* края сэмпла в ноль: нет щелчка на старте, в конце и на стыке петли */
+        out[i] = (int16_t)((int)out[i] * i / 24);
+        out[frames - 1 - i] = (int16_t)((int)out[frames - 1 - i] * i / 24);
+    }
     Pad *p = &g_pad[pi];
     uint8_t pk[PAD_PK];
     for (int c = 0; c < PAD_PK; c++) {
@@ -4064,7 +4070,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя планка */
     text(50, 22, K_BROWN, 1.1f, "VITA SAMPLER");
-    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.6");
+    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.7");
     text(560, 26, K_BROWN, 0.62f, "REC");
     text(648, 26, K_BROWN, 0.62f, "PLAY");
     text(736, 26, K_BROWN, 0.62f, "LOOP");
@@ -5028,8 +5034,14 @@ static void slice_nudge(int idx, int delta) {
 static uint64_t g_pad_last_us[PAD_N];                /* защита от дребезга: один пад не чаще раза в 30 мс */
 static int pad_lockout(int i) {
     uint64_t t = sceKernelGetProcessTimeWide();
-    if (g_pad_last_us[i] && t - g_pad_last_us[i] < 30000) return 1;
+    if (g_pad_last_us[i] && t - g_pad_last_us[i] < 30000) { g_pad_lock++; return 1; }
     g_pad_last_us[i] = t;
+    g_pad_hits++;
+    if (g_pad_hits <= 400) {                              /* первые удары: подробно, чтобы по логу понять, что происходит */
+        int act = 0;
+        for (int k = 0; k < PAD_VOICES; k++) if (g_pv[k].stage) act++;
+        dbg_log("pad hit pad=%d n=%d voices=%d touches=%d load=%d late=%d", i, g_pad_hits, act, A.prev_n, g_out_load, g_out_late);
+    }
     return 0;
 }
 static void pad_press(int id, int i) {
@@ -5147,7 +5159,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v1.6");
+    dbg_log("start v1.7");
     scePowerSetArmClockFrequency(444);              /* максимум: больше запаса для звука и отрисовки */
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
@@ -5945,9 +5957,9 @@ int main(void) {
 
         /* ---- лог: пульс раз в ~1.5 с и ошибки ---- */
         if (frame % 90 == 0)
-            dbg_log("hb f=%u st=%d mode=%d len=%d pos=%d lvl=%d split=%d fx=%d scrub=%d mic_late=%d mic_odd=%d r0=%d out_late=%d load=%d",
+            dbg_log("hb f=%u st=%d mode=%d len=%d pos=%d lvl=%d split=%d fx=%d scrub=%d mic_late=%d mic_odd=%d r0=%d out_late=%d load=%d pad[hit=%d drop=%d steal=%d lock=%d]",
                     frame, state, g_mode, length, playhead, g_level, split, A.page, A.scrubbing,
-                    g_in_late, g_in_odd, g_in_r0, g_out_late, g_out_load);
+                    g_in_late, g_in_odd, g_in_r0, g_out_late, g_out_load, g_pad_hits, g_pad_drop, g_pad_steal, g_pad_lock);
         if (g_error != last_err) { last_err = g_error; dbg_log("audio error 0x%08X", (unsigned)g_error); }
         prev_state = state;
 
