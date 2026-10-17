@@ -68,7 +68,7 @@ def key(name, pressed):
     bx, by, bw, bh = 8, 5, 36, 36
     off = 2.5 if pressed else 0.0
     wall_h = 1.5 if pressed else 4.0
-    r = 10.0
+    r = 17.5
     if not pressed:                                   # стенка (передняя грань) под лицом
         d = rrect_sd(x, y, bx, by + wall_h, bw, bh, r)
         over(im, wall, cover(d))
@@ -101,22 +101,15 @@ def lamp(color, on):
     if on:                                            # свечение
         for k, a in ((19, 0.06), (16, 0.10), (13.5, 0.16)):
             over(im, color, cover(rr - k) * a)
-    over(im, (8, 50, 68), cover(rr - 12.2))           # обводка
-    ring = vgrad(y, cy - 11.4, cy + 11.4, (238, 252, 252), (120, 176, 188))
-    over(im, ring, cover(rr - 11.2))
-    over(im, (10, 66, 86), cover(rr - 8.4))           # лунка
-    over(im, (4, 34, 48), cover(rr - 7.6))
     c0 = np.asarray(color, np.float32)
+    over(im, (6, 40, 58), cover(rr - 9.6))            # тёмная обводка
     if on:
-        gem = vgrad(y, cy - 6.5, cy + 6.5, np.minimum(c0 * 1.25 + 40, 255), c0 * 0.82)
+        gem = vgrad(y, cy - 8.5, cy + 8.5, np.minimum(c0 * 1.3 + 50, 255), c0 * 0.75)
     else:
-        gem = vgrad(y, cy - 6.5, cy + 6.5, c0 * 0.42 + 8, c0 * 0.16 + 4)
-    over(im, gem, cover(rr - 6.4))
-    # блик камня: светлое пятно сверху-слева
-    hl = np.hypot(x - (cx - 2.2), y - (cy - 2.6))
-    over(im, (255, 255, 255), cover(hl - 2.1) * (0.95 if on else 0.40))
-    if on:
-        over(im, (255, 255, 255), cover(np.hypot(x - cx, y - cy) - 3.0) * 0.22)
+        gem = vgrad(y, cy - 8.5, cy + 8.5, c0 * 0.38 + 14, c0 * 0.14 + 6)
+    over(im, gem, cover(rr - 8.2))
+    hl = rrect_sd(x, y, cx - 5.2, cy - 6.6, 10.4, 5.2, 2.6)   # овальный блик сверху
+    over(im, (255, 255, 255), cover(hl) * (0.9 if on else 0.35))
     return down(im)
 
 
