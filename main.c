@@ -939,7 +939,7 @@ static void pad_mix_add(int16_t *mono, int *peak) {
             }
             float xs = smp * v->env;
             if (comp_on) {                                                  /* компрессор пада: следящая огибающая, усиление каждые 16 отсчётов */
-                float lv = fabsf(xs) * (1.0f / 32768.0f);
+                float lv = (xs < 0.0f ? -xs : xs) * (1.0f / 32768.0f);
                 v->cenv += (lv > v->cenv ? 0.0042f : 0.0002f) * (lv - v->cenv);
                 if ((i & 15) == 0) {
                     float tg = 1.0f;
