@@ -17,18 +17,27 @@ jobs:
         run: |
           cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake
           cmake --build build
+      - name: Имя VPK с версией
+        id: ver
+        run: |
+          V=$(sed -n 's/.*set(VITA_VERSION *"\([0-9.]*\)").*/\1/p' CMakeLists.txt | head -1 | sed 's/^0*\([0-9]\)/\1/')
+          N=$(basename "$(ls build/*.vpk | head -1)" .vpk)
+          cp "build/$N.vpk" "build/$N-v$V.vpk"
+          echo "ver=$V" >> "$GITHUB_OUTPUT"
+          echo "name=$N-v$V" >> "$GITHUB_OUTPUT"
+          echo "file=build/$N-v$V.vpk" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: Sampler-vpk
-          path: build/Sampler.vpk
-      - name: Publish latest release
+          name: ${{ steps.ver.outputs.name }}
+          path: ${{ steps.ver.outputs.file }}
+      - name: Publish release
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Latest build
+          name: Latest build (${{ steps.ver.outputs.name }})
           prerelease: true
           target_commitish: ${{ github.sha }}
-          body: "Автосборка из main"
-          files: build/Sampler.vpk
+          body: "Автосборка из main: ${{ steps.ver.outputs.name }}.vpk"
+          files: ${{ steps.ver.outputs.file }}
           overwrite_files: true
