@@ -65,29 +65,26 @@ def key(name, pressed):
     W = H = 52
     x, y = grid(W, H)
     im = new(W, H)
-    bx, by, bw, bh = 8, 5, 36, 36
-    off = 2.5 if pressed else 0.0
-    wall_h = 1.5 if pressed else 4.0
-    r = 17.5
-    if not pressed:                                   # стенка (передняя грань) под лицом
-        d = rrect_sd(x, y, bx, by + wall_h, bw, bh, r)
-        over(im, wall, cover(d))
-        over(im, edge, cover(np.abs(d + 0.5) - 0.5))
-    d = rrect_sd(x, y, bx, by + off, bw, bh, r)
+    bx, by, bw, bh = 7, 5, 38, 38
+    R = 18.5
+    dy = 1.0 if pressed else 0.0
+    # внешний серебристый ободок
+    d = rrect_sd(x, y, bx, by, bw, bh + 2, R + 1)
+    over(im, (10, 52, 70), cover(d))
+    rim = vgrad(y, by, by + bh + 2, (250, 255, 255) if not pressed else (150, 176, 186), (140, 172, 184) if not pressed else (236, 248, 250))
+    over(im, rim, cover(d + 1.4))
+    # внутренняя капсула
+    ix, iy, iw, ih = bx + 4, by + 4 + dy, bw - 8, bh - 8
+    d2 = rrect_sd(x, y, ix, iy, iw, ih, R - 4)
+    over(im, (10, 52, 70), cover(d2))
     f0, f1 = (bot, top) if pressed else (top, bot)
-    face = vgrad(y, by + off, by + off + bh, f0, f1)
-    over(im, face, cover(d))
-    # глянцевая «пиксельная» полоса: верхняя половина светлее с жёсткой границей
-    gl = (y < by + off + bh * 0.46) & (d < -2.0)
+    face = vgrad(y, iy, iy + ih, f0, f1)
+    over(im, face, cover(d2 + 1.4))
     if not pressed:
-        over(im, (255, 255, 255), cover(d + 2.0) * gl * 0.34)
-    over(im, edge, cover(np.abs(d + 0.6) - 0.6))      # кромка
-    if not pressed:                                   # светлая подсветка сверху-слева (1 пиксель внутри кромки)
-        hi = (d > -2.2) & (d < -1.1) & ((y - (by + off)) < (x - bx) * 0.9 + 6)
-        over(im, (255, 255, 255), hi * 0.85)
-    else:                                             # нажатая: тёмный «вдавленный» верхний край
-        sh = (d > -2.6) & (d < -1.2) & (y < by + off + 6)
-        over(im, edge, sh * 0.35)
+        gl = (y < iy + ih * 0.45)
+        over(im, (255, 255, 255), cover(d2 + 3.0) * gl * 0.40)
+    else:
+        over(im, edge, cover(d2 + 1.4) * (d2 > -4.0) * (y < iy + 7) * 0.30)
     return down(im)
 
 
@@ -98,18 +95,17 @@ def lamp(color, on):
     im = new(W, H)
     cx = cy = 20.0
     rr = np.hypot(x - cx, y - cy)
-    if on:                                            # свечение
-        for k, a in ((19, 0.06), (16, 0.10), (13.5, 0.16)):
-            over(im, color, cover(rr - k) * a)
     c0 = np.asarray(color, np.float32)
-    over(im, (6, 40, 58), cover(rr - 9.6))            # тёмная обводка
+    over(im, (10, 52, 70), cover(rr - 10.5))          # внешняя обводка
+    over(im, (222, 240, 244) if on else (170, 198, 208), cover(rr - 9.4))   # светлое кольцо
+    over(im, (10, 52, 70), cover(rr - 6.8))           # обводка бусины
     if on:
-        gem = vgrad(y, cy - 8.5, cy + 8.5, np.minimum(c0 * 1.3 + 50, 255), c0 * 0.75)
+        gem = vgrad(y, cy - 5.6, cy + 5.6, np.minimum(c0 * 1.3 + 60, 255), c0 * 0.85)
     else:
-        gem = vgrad(y, cy - 8.5, cy + 8.5, c0 * 0.38 + 14, c0 * 0.14 + 6)
-    over(im, gem, cover(rr - 8.2))
-    hl = rrect_sd(x, y, cx - 5.2, cy - 6.6, 10.4, 5.2, 2.6)   # овальный блик сверху
-    over(im, (255, 255, 255), cover(hl) * (0.9 if on else 0.35))
+        gem = vgrad(y, cy - 5.6, cy + 5.6, c0 * 0.30 + 40, c0 * 0.12 + 20)
+    over(im, gem, cover(rr - 5.7))
+    hl = np.hypot(x - (cx - 1.6), y - (cy - 2.2))
+    over(im, (255, 255, 255), cover(hl - 1.6) * (0.9 if on else 0.3))
     return down(im)
 
 

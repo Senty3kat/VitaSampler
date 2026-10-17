@@ -1,5 +1,5 @@
 /*
- * Vita Sampler v1.9
+ * Vita Sampler v2.0
  *
  * Кнопки: R запись/стоп, L пауза/play (удержание L = глитч, задняя панель: палец вверх/вниз = 1-30 Гц),
  *   Треугольник стоп, Квадрат петля, Круг страница FX, START сохранить WAV, SELECT справка,
@@ -4266,7 +4266,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя планка */
     text(50, 22, K_BROWN, 1.1f, "VITA SAMPLER");
-    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.9");
+    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v2.0");
     text(560, 26, K_BROWN, 0.62f, "REC");
     text(648, 26, K_BROWN, 0.62f, "PLAY");
     text(736, 26, K_BROWN, 0.62f, "LOOP");
@@ -4386,7 +4386,7 @@ static void ui_draw(const UiState *u) {
             if (on) text_r(x + w - 18, y + 38, K_YELLOW, 0.72f, "ACTIVE");
         }
         char b2[80];
-        snprintf(b2, sizeof(b2), "Vita Sampler v1.9     audio load %d.%d %%", g_out_load / 10, g_out_load % 10);
+        snprintf(b2, sizeof(b2), "Vita Sampler v2.0     audio load %d.%d %%", g_out_load / 10, g_out_load % 10);
         text(CRT_X + 16, CRT_Y + CRT_H - 20, K_AMBER_DIM, 0.6f, b2);
     }
 
@@ -5380,7 +5380,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v1.9");
+    dbg_log("start v2.0");
     scePowerSetArmClockFrequency(444);              /* максимум: больше запаса для звука и отрисовки */
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
