@@ -48,7 +48,7 @@ vita2d_pgf *vita2d_load_default_pgf(void) { return NULL; }
 void vita2d_free_pgf(vita2d_pgf *f) { (void)f; }
 int vita2d_pgf_draw_text(vita2d_pgf *f, int x, int y, unsigned int c, float s, const char *t) { (void)f; (void)x; (void)y; (void)c; (void)s; (void)t; return 0; }
 vita2d_font *vita2d_load_font_file(const char *fn) {
-    const char *map = strstr(fn, "mono") ? "fonts/DejaVuSansMono-Bold.ttf" : "fonts/DejaVuSansCondensed-Bold.ttf";
+    const char *map = strstr(fn, "pix9") ? "fonts/pix9.ttf" : strstr(fn, "pix11") ? "fonts/pix11.ttf" : strstr(fn, "pix13") ? "fonts/pix13.ttf" : strstr(fn, "mono") ? "fonts/DejaVuSansMono-Bold.ttf" : "fonts/DejaVuSansCondensed-Bold.ttf";
     char path[256]; snprintf(path, sizeof(path), "%s/%s", getenv("FONT_DIR") ? getenv("FONT_DIR") : "..", map);
     vita2d_font *f = malloc(sizeof(*f));
     if (FT_New_Face(g_ft, path, 0, &f->face)) { free(f); return NULL; }

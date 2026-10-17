@@ -1,5 +1,5 @@
 /*
- * Vita Sampler v1.8
+ * Vita Sampler v1.9
  *
  * Кнопки: R запись/стоп, L пауза/play (удержание L = глитч, задняя панель: палец вверх/вниз = 1-30 Гц),
  *   Треугольник стоп, Квадрат петля, Круг страница FX, START сохранить WAV, SELECT справка,
@@ -112,9 +112,31 @@ unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
  * Тема 0 «Classic» - цвета как есть. Тема 1 «Aqua» - тёплые тона (оранжевый, жёлтый, кремовый, коричневый) поворачиваются в голубой/бирюзовый,
  * красные, зелёные и серые остаются; так же обрабатываются и PNG-спрайты при загрузке. */
 static int g_theme = 0;
+static int g_scr = 0;                                /* 1 - рисуется содержимое экрана (LCD): цвета переводятся в тёмные на светлом фоне */
 #define N_THEMES 2
+/* Aqua: экран - тёмно-голубой фон и светло-голубые знаки (как в Winamp-скинах): тёмные цвета (фон ЭЛТ) -> тёмно-голубой, светлые (янтарь, белый) -> светло-голубой, красные/зелёные - как есть */
+static uint32_t th_screen(uint32_t c) {
+    float r = (float)(c & 255) * (1.0f / 255.0f), g = (float)((c >> 8) & 255) * (1.0f / 255.0f), b = (float)((c >> 16) & 255) * (1.0f / 255.0f);
+    float mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b), d = mx - mn;
+    if (d > 0.25f * mx && mx > 0.3f) {                                  /* насыщенные красные и зелёные не трогаем */
+        float h;
+        if (mx == r) h = (g - b) / d + (g < b ? 6.0f : 0.0f); else if (mx == g) h = (b - r) / d + 2.0f; else h = (r - g) / d + 4.0f;
+        h *= 60.0f;
+        if (h < 14.0f || h > 75.0f) return c;
+    }
+    int cr, cg, cb;
+    if (mx < 0.30f) {                                                   /* фон: тёмно-голубой, у самых тёмных ещё темнее */
+        float t = mx / 0.30f;
+        cr = (int)(5.0f + (11.0f - 5.0f) * t); cg = (int)(50.0f + (84.0f - 50.0f) * t); cb = (int)(70.0f + (108.0f - 70.0f) * t);
+    } else {                                                            /* знаки: светло-голубые, ярче всего у самых светлых цветов */
+        float t = (1.0f - mx) / 0.70f;
+        cr = (int)(200.0f + (80.0f - 200.0f) * t); cg = (int)(252.0f + (178.0f - 252.0f) * t); cb = (int)(255.0f + (196.0f - 255.0f) * t);
+    }
+    return (c & 0xFF000000u) | (uint32_t)cr | ((uint32_t)cg << 8) | ((uint32_t)cb << 16);
+}
 static uint32_t th_map(uint32_t c) {
     if (g_theme == 0) return c;
+    if (g_scr) return th_screen(c);
     float r = (float)(c & 255) * (1.0f / 255.0f), g = (float)((c >> 8) & 255) * (1.0f / 255.0f), b = (float)((c >> 16) & 255) * (1.0f / 255.0f);
     float mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b), d = mx - mn;
     if (mx <= 0.0f || d < 0.02f) return c;                          /* серые и чёрные не трогаем */
@@ -2192,24 +2214,47 @@ static void rect_outline(int x, int y, int w, int h, int t, unsigned int c) {
 
 /* шрифт: DejaVu Sans Condensed Bold и DejaVu Sans Mono Bold из app0:fonts; если файла нет - запасной системный */
 static vita2d_font *g_font = NULL, *g_font_m = NULL;
+static vita2d_font *g_pf[3];                         /* пиксельные шрифты темы Aqua: кегли 9, 11, 13 (и вдвое больше) */
 static void fonts_load(void) {
     g_font = vita2d_load_font_file("app0:fonts/cond.ttf");
     g_font_m = vita2d_load_font_file("app0:fonts/mono.ttf");
+    g_pf[0] = vita2d_load_font_file("app0:fonts/pix9.ttf");
+    g_pf[1] = vita2d_load_font_file("app0:fonts/pix11.ttf");
+    g_pf[2] = vita2d_load_font_file("app0:fonts/pix13.ttf");
+}
+/* в пиксельной теме кегль подбирается так, чтобы глифы ложились на сетку: 9, 11, 13 или вдвое больше */
+static vita2d_font *pf_pick(unsigned int px, unsigned int *size) {
+    static const unsigned sz[6] = { 9, 11, 13, 18, 22, 26 };
+    int k = px <= 10 ? 0 : (px <= 12 ? 1 : (px <= 15 ? 2 : (px <= 20 ? 3 : (px <= 24 ? 4 : 5))));
+    vita2d_font *f = g_pf[k % 3];
+    if (!f) return NULL;
+    *size = sz[k];
+    return f;
 }
 static void fonts_free(void) {
+    for (int i = 0; i < 3; i++) if (g_pf[i]) { vita2d_free_font(g_pf[i]); g_pf[i] = NULL; }
     if (g_font) { vita2d_free_font(g_font); g_font = NULL; }
     if (g_font_m) { vita2d_free_font(g_font_m); g_font_m = NULL; }
 }
 static void text(int x, int y, unsigned int c, float s, const char *t) {
-    if (g_font) vita2d_font_draw_text(g_font, x, y, c, (unsigned int)(s * 17.0f + 0.5f), t);
+    unsigned int psz;
+    vita2d_font *pf = g_theme == 1 ? pf_pick((unsigned int)(s * 17.0f + 0.5f), &psz) : NULL;
+    if (pf) vita2d_font_draw_text(pf, x, y, c, psz, t);
+    else if (g_font) vita2d_font_draw_text(g_font, x, y, c, (unsigned int)(s * 17.0f + 0.5f), t);
     else vita2d_pgf_draw_text(g_pgf, x, y, c, s, t);
 }
 static void text_m(int x, int y, unsigned int c, float s, const char *t) {
+    unsigned int psz;
+    vita2d_font *pf = g_theme == 1 ? pf_pick((unsigned int)(s * 17.0f + 0.5f), &psz) : NULL;
+    if (pf) { vita2d_font_draw_text(pf, x, y, c, psz, t); return; }
     vita2d_font *f = g_font_m ? g_font_m : g_font;
     if (f) vita2d_font_draw_text(f, x, y, c, (unsigned int)(s * 17.0f + 0.5f), t);
     else vita2d_pgf_draw_text(g_pgf, x, y, c, s, t);
 }
 static int text_w(const char *t, float s) {
+    unsigned int psz;
+    vita2d_font *pf = g_theme == 1 ? pf_pick((unsigned int)(s * 17.0f + 0.5f), &psz) : NULL;
+    if (pf) return vita2d_font_text_width(pf, psz, t);
     if (g_font) return vita2d_font_text_width(g_font, (unsigned int)(s * 17.0f + 0.5f), t);
     return (int)((float)strlen(t) * 9.6f * s);
 }
@@ -2306,16 +2351,17 @@ static inline float wv_at(int length, double p) {
     return (float)g_audio[i] * (1.0f - f) + (float)g_audio[j] * f;
 }
 
+static void pix_apply(uint32_t *px, int stride, int w, int h);
 static void render_wave(vita2d_texture *tex, const Layout *L, int length, int live) {
     uint32_t *px = (uint32_t *)vita2d_texture_get_datap(tex);
     int stride = (int)vita2d_texture_get_stride(tex) / 4;
     memset(px, 0, (size_t)stride * WAVE_H * 4);
-
+    g_scr = 1;
     int cy = WAVE_H / 2;
     int half = WAVE_H / 2 - 4;
     for (int sg = 0; sg < L->nseg; sg++)
-        for (int x = 0; x < L->w[sg]; x++) px[cy * stride + L->x0[sg] + x] = RGBA8(190, 120, 50, 150);
-    if (length <= 0) return;
+        for (int x = 0; x < L->w[sg]; x++) px[cy * stride + L->x0[sg] + x] = RGBA8T(190, 120, 50, 150);
+    if (length <= 0) { g_scr = 0; return; }
 
     int peak = g_peak_all;
     if (peak < 3000) peak = 3000;
@@ -2404,6 +2450,8 @@ static void render_wave(vita2d_texture *tex, const Layout *L, int length, int li
             }
         }
     }
+    g_scr = 0;
+    if (g_theme == 1) pix_apply(px, stride, WAVE_W, WAVE_H);
 }
 
 
@@ -3184,6 +3232,7 @@ static void skin_render_static_ex(Canvas *c, int pad) {
         cv_rrect(c, bx + 14, by + bh - 5.5f, bw - 28, 1.2f, 0.6f, RGBA8T(255, 170, 90, 120));
 
         /* ЭЛТ: тёмная трубка, сетка */
+        g_scr = 1;
         cv_rrect_grad(c, cx, cy, cw, ch, 9, RGBA8T(30, 20, 14, 255), RGBA8T(12, 8, 5, 255));
         if (!pad) {
             for (int i = 1; i < 4; i++) {
@@ -3198,6 +3247,7 @@ static void skin_render_static_ex(Canvas *c, int pad) {
             }
             for (int i = 1; i < 12; i++) cv_rect(c, PBZ_X + 24 + i * 346 / 12, 102, 1, 82, RGBA8T(255, 150, 46, 20));
         }
+        g_scr = 0;
     }
 
     if (!pad) {
@@ -3272,13 +3322,13 @@ static void glass_render_ex(Canvas *c, const int cw, const int ch) {
                 continue;
             }
             float in = -d;
-            cv_put(c, x, y, RGBA8T(255, 120, 20, 255), 0.06f);                       /* оранжевое стекло */
+            if (g_theme != 1) cv_put(c, x, y, RGBA8T(255, 120, 20, 255), 0.06f);                       /* оранжевое стекло */
             float ex = (fx / (cw * 0.5f) - 1.0f), ey = (fy / (ch * 0.5f) - 1.0f);
             float rr = powf(powf(fabsf(ex), 2.6f) + powf(fabsf(ey), 2.6f), 1.0f / 2.6f);   /* суперэллипс: 0 в центре, 1 у края */
             float glow = 1.0f - rr * rr;
-            if (glow > 0.0f) cv_put(c, x, y, RGBA8T(255, 150, 50, 255), 0.05f * glow);   /* свечение люминофора в центре */
+            if (glow > 0.0f && g_theme != 1) cv_put(c, x, y, RGBA8T(255, 150, 50, 255), 0.05f * glow);   /* свечение люминофора в центре */
             float vg = rr > 0.55f ? (rr - 0.55f) / 0.45f : 0.0f;                    /* выпуклость: края темнеют */
-            if (vg > 0.0f) cv_put(c, x, y, RGBA8T(6, 2, 0, 255), fclampf(vg, 0.0f, 1.0f) * 0.6f);
+            if (vg > 0.0f && g_theme != 1) cv_put(c, x, y, RGBA8T(6, 2, 0, 255), fclampf(vg, 0.0f, 1.0f) * 0.6f);
             if (lit > 0.0f && in < 14.0f) cv_put(c, x, y, RGBA8T(0, 0, 0, 255), 0.5f * lit * expf(-in / 5.0f));    /* тень от оправы */
             if (lit < 0.0f && in < 10.0f) cv_put(c, x, y, RGBA8T(255, 190, 120, 255), 0.22f * -lit * expf(-in / 3.0f));   /* отсвет на нижнем крае */
             /* дуга блика вдоль верхнего левого края (отражение оправы в стекле) */
@@ -3294,7 +3344,7 @@ static void glass_render_ex(Canvas *c, const int cw, const int ch) {
                 float re = 1.0f - (rx * rx + ry * ry);
                 if (re > 0.0f) cv_put(c, x, y, RGBA8T(255, 200, 140, 255), 0.06f * re);
             }
-            if (y % 3 == 1) cv_put(c, x, y, RGBA8T(0, 0, 0, 255), 0.15f * (1.0f - 0.5f * glow));   /* строки развёртки: к краям заметнее */
+            if (y % 3 == 1 && g_theme != 1) cv_put(c, x, y, RGBA8T(0, 0, 0, 255), 0.15f * (1.0f - 0.5f * glow));   /* строки развёртки: к краям заметнее */
         }
 }
 static void glass_render(Canvas *c) { glass_render_ex(c, CRT_W, CRT_H); }
@@ -3381,6 +3431,7 @@ static void draw_curve(Canvas *c, int cy0) {
     const int ox = CURVE_X, oy = CURVE_Y - cy0, w = CURVE_W, h = CURVE_H;
     cv_rrect_grad(c, (float)(ox - 4), (float)(oy - 4), (float)(w + 8), (float)(h + 8), 5, RGBA8T(214, 104, 24, 255), RGBA8T(140, 56, 8, 255));
     cv_rrect_stroke(c, (float)(ox - 4), (float)(oy - 4), (float)(w + 8), (float)(h + 8), 5, 1.0f, RGBA8T(90, 34, 4, 255));
+    g_scr = 1;
     cv_rrect_grad(c, (float)ox, (float)oy, (float)w, (float)h, 3, RGBA8T(30, 20, 14, 255), RGBA8T(12, 8, 5, 255));
     static const float dbl[3] = { 0.0f, -12.0f, -24.0f };
     for (int i = 0; i < 3; i++) for (int x = 0; x < w; x += 6) cv_rect(c, ox + x, oy + (int)curve_y_of(dbl[i]), 3, 1, RGBA8T(255, 150, 46, 40));
@@ -3408,6 +3459,7 @@ static void draw_curve(Canvas *c, int cy0) {
         cv_ring(c, (float)(ox + xc), (float)oy + yc, 7.0f, 1.6f, RGBA8T(255, 224, 90, 255));
     }
     for (int y = 1; y < h; y += 3) cv_rect(c, ox, oy + y, w, 1, RGBA8T(0, 0, 0, 42));     /* строки развёртки */
+    g_scr = 0;
 }
 
 
@@ -3506,6 +3558,7 @@ static void env_points(const Pad *p, float *px, float *py) {
 
 /* осциллограф: форма волны выбранного сэмпла; на подстранице ADSR поверх неё - огибающая */
 static void env_render(Canvas *c, const Pad *p, int with_env) {
+    g_scr = 1;
     cv_clear(c, 0);
     float mid = (ENV_BASE + ENV_TOP) * 0.5f, amp = (ENV_BASE - ENV_TOP) * 0.5f;
     cv_rect(c, 0, (int)mid, c->w, 1, RGBA8T(255, 150, 46, 60));
@@ -3557,6 +3610,7 @@ static void env_render(Canvas *c, const Pad *p, int with_env) {
         static const int idx[3] = { 1, 2, 4 };
         for (int k = 0; k < 3; k++) cv_circle(c, px[idx[k]], py[idx[k]], 3.2f, RGBA8T(255, 232, 160, 255));
     }
+    g_scr = 0;
 }
 
 /* пад 104x104: объёмная клавиша; выбранный - оранжевый и залипает; внутри номер, мини-волна, имя (текст рисуется отдельно) */
@@ -3784,11 +3838,66 @@ static int g_env_cur = -1, g_env_next = 0;
 static uint32_t g_sig_env = 0;
 static vita2d_texture *g_tex_mglass = NULL;
 
+/* пиксельная тема: блоки 2x2 (ближайший пиксель), цвет с упорядоченным дизерингом в ограниченную палитру, края без полутонов */
+static void pix_apply(uint32_t *px, int stride, int w, int h) {
+    static const int bay[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+    const int step = 16;
+    for (int by = 0; by < h; by += 2)
+        for (int bx = 0; bx < w; bx += 2) {
+            uint32_t v = px[(size_t)by * stride + bx];
+            int a = v >> 24;
+            uint32_t o;
+            if (a < 28) o = 0;
+            else {
+                int t = (bay[((by >> 1) & 3) * 4 + ((bx >> 1) & 3)] * step) / 16 - step / 2;
+                int ch[3];
+                for (int k = 0; k < 3; k++) {
+                    int q = (int)((v >> (8 * k)) & 255) + t;
+                    q = ((q + step / 2) / step) * step;
+                    ch[k] = q < 0 ? 0 : (q > 255 ? 255 : q);
+                }
+                int aq = a >= 250 ? 255 : a;
+                o = (uint32_t)ch[0] | ((uint32_t)ch[1] << 8) | ((uint32_t)ch[2] << 16) | ((uint32_t)aq << 24);
+            }
+            px[(size_t)by * stride + bx] = o;
+            if (bx + 1 < w) px[(size_t)by * stride + bx + 1] = o;
+            if (by + 1 < h) { px[(size_t)(by + 1) * stride + bx] = o; if (bx + 1 < w) px[(size_t)(by + 1) * stride + bx + 1] = o; }
+        }
+}
+/* контур спрайтов: непрозрачный блок рядом с почти прозрачным становится тёмно-бирюзовым (как обводка в пиксельных скинах) */
+static void pix_outline(uint32_t *px, int stride, int w, int h) {
+    int bw = (w + 1) / 2, bh = (h + 1) / 2;
+    uint8_t *edge = (uint8_t *)calloc((size_t)bw * bh, 1);
+    if (!edge) return;
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++) {
+            if ((px[(size_t)(by * 2) * stride + bx * 2] >> 24) < 250) continue;
+            static const int dx[4] = { 1, -1, 0, 0 }, dy[4] = { 0, 0, 1, -1 };
+            for (int k = 0; k < 4; k++) {
+                int nx = bx + dx[k], ny = by + dy[k];
+                if (nx < 0 || ny < 0 || nx >= bw || ny >= bh) continue;
+                if ((px[(size_t)(ny * 2) * stride + nx * 2] >> 24) < 60) { edge[by * bw + bx] = 1; break; }
+            }
+        }
+    const uint32_t oc = RGBA8(8, 50, 68, 255);
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++)
+            if (edge[by * bw + bx])
+                for (int j = 0; j < 2; j++) for (int i = 0; i < 2; i++)
+                    if (by * 2 + j < h && bx * 2 + i < w) px[(size_t)(by * 2 + j) * stride + bx * 2 + i] = oc;
+    free(edge);
+}
 static void upload_canvas(vita2d_texture *tex, const Canvas *c) {
     if (!tex) return;
     uint32_t *dst = (uint32_t *)vita2d_texture_get_datap(tex);
     int stride = (int)vita2d_texture_get_stride(tex) / 4;
     for (int y = 0; y < c->h; y++) memcpy(dst + (size_t)y * stride, c->px + (size_t)y * c->w, (size_t)c->w * 4);
+    if (g_theme == 1) {
+        pix_apply(dst, stride, c->w, c->h);
+        int sprites = 0;
+        for (int i = 0; i < 6; i++) if (c == &g_cv_page[i]) sprites = 1;
+        if (sprites) pix_outline(dst, stride, c->w, c->h);
+    }
 }
 
 static void ui_create_textures(void) {
@@ -4157,7 +4266,7 @@ static void ui_draw(const UiState *u) {
 
     /* верхняя планка */
     text(50, 22, K_BROWN, 1.1f, "VITA SAMPLER");
-    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.8");
+    text(50, 34, K_BROWN_LO, 0.5f, "SAMPLER / LOOPER   v1.9");
     text(560, 26, K_BROWN, 0.62f, "REC");
     text(648, 26, K_BROWN, 0.62f, "PLAY");
     text(736, 26, K_BROWN, 0.62f, "LOOP");
@@ -4175,6 +4284,7 @@ static void ui_draw(const UiState *u) {
         text_c(x + w / 2, y + h / 2 + 5, sel ? K_BROWN : K_BROWN_LO, 0.74f, page_name[i]);
     }
 
+    g_scr = 1;
     if (u->page == 5) draw_pad_crt(u);
     else {
     /* окно ЭЛТ: время, номер сэмпла, уровень */
@@ -4233,7 +4343,7 @@ static void ui_draw(const UiState *u) {
         text(WAVE_X + WAVE_W - 150, 312, K_AMBER, 0.72f, buf);
     }
     }
-    if (u->page == 5) text(PBZ_X + 4, 226, u->confirm ? K_YELLOW : K_BROWN, 0.66f, u->msg);
+    if (u->page == 5) { g_scr = 0; text(PBZ_X + 4, 226, u->confirm ? K_YELLOW : K_BROWN, 0.66f, u->msg); g_scr = 1; }
     else text(WAVE_X, 329, u->confirm ? K_YELLOW : K_AMBER_LT, 0.82f, u->msg);
 
     /* справка поверх экрана */
@@ -4276,10 +4386,11 @@ static void ui_draw(const UiState *u) {
             if (on) text_r(x + w - 18, y + 38, K_YELLOW, 0.72f, "ACTIVE");
         }
         char b2[80];
-        snprintf(b2, sizeof(b2), "Vita Sampler v1.8     audio load %d.%d %%", g_out_load / 10, g_out_load % 10);
+        snprintf(b2, sizeof(b2), "Vita Sampler v1.9     audio load %d.%d %%", g_out_load / 10, g_out_load % 10);
         text(CRT_X + 16, CRT_Y + CRT_H - 20, K_AMBER_DIM, 0.6f, b2);
     }
 
+    g_scr = 0;
     /* стекло перед ЭЛТ */
     if (u->page == 5) { if (g_tex_glass2) vita2d_draw_texture(g_tex_glass2, PCRT_X - GL_M, PCRT_Y - GL_M); }
     else if (g_tex_glass) vita2d_draw_texture(g_tex_glass, CRT_X - GL_M, CRT_Y - GL_M);
@@ -5269,7 +5380,7 @@ int main(void) {
         SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (fd >= 0) sceIoClose(fd);
     }
-    dbg_log("start v1.8");
+    dbg_log("start v1.9");
     scePowerSetArmClockFrequency(444);              /* максимум: больше запаса для звука и отрисовки */
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
